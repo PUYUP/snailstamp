@@ -6,7 +6,6 @@ from snailstamp.apps.tenant.models import (
     Member,
     Owner,
     Invitation,
-    Certificate,
 )
 
 
@@ -24,7 +23,6 @@ admin.site.register(Association, AssociationAdmin)
 admin.site.register(Member)
 admin.site.register(Owner)
 admin.site.register(Invitation)
-admin.site.register(Certificate)
 
 # Remove organizations models from django admin
 admin.site.unregister(organizations.models.Organization)

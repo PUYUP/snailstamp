@@ -12,6 +12,7 @@ PyNaCl>=1.6.2
 django-guardian>=3.5.0
 django-organizations>=2.7.0
 drf-spectacular>=0.30.0
+dj-database-url>=3.1.2
 
 [dev]
 django-debug-toolbar>=4.4

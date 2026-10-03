@@ -18,6 +18,7 @@ Requires-Dist: PyNaCl>=1.6.2
 Requires-Dist: django-guardian>=3.5.0
 Requires-Dist: django-organizations>=2.7.0
 Requires-Dist: drf-spectacular>=0.30.0
+Requires-Dist: dj-database-url>=3.1.2
 Provides-Extra: dev
 Requires-Dist: django-debug-toolbar>=4.4; extra == "dev"
 Requires-Dist: pytest>=8.0; extra == "dev"

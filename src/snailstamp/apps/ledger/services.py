@@ -2,15 +2,24 @@
 Satu-satunya pintu TULIS ke ledger. Setiap fungsi = 1 pemanggilan fungsi
 PostgreSQL (atomik, 1 round-trip, row-lock hanya pada 1 collection).
 
-Autentikasi/otorisasi level aplikasi (siapa `actor`) ditangani view/API Anda;
-database tetap memverifikasi kepemilikan & state-machine sebagai lapis kedua.
+Identitas: association -> member -> user.
+  * `*_id` di sini (issuer_id, actor_id, ...) = ASSOCIATION: pemilik item.
+  * `*_member_id` = MEMBER yang bertindak atas nama association itu; tercatat di tiap log.
+  * User tidak pernah masuk ledger.
+
+Otorisasi: view/API Anda memastikan siapa user yang login & member mana yang ia pakai.
+Lapis ini (`_check_member`) memastikan member itu benar anggota association-nya SEBELUM tulis;
+database lalu memverifikasi kepemilikan & state-machine sebagai lapis kedua.
 """
 import hashlib
 import json
 import struct
 from datetime import datetime, timedelta, timezone
 
+from django.apps import apps
+from django.conf import settings
 from django.db import DatabaseError, connection, transaction
+from django.utils.module_loading import import_string
 
 from .models import Action, Block, Collection, Kind, Log
 
@@ -60,22 +69,59 @@ def _json(value):
 
 # ---------------------------------------------------------------- operasi
 def _kind_id(kind):
-    return kind if isinstance(kind, int) else Kind.objects.get(code=kind).id
+    if isinstance(kind, int):
+        return kind
+    try:
+        return Kind.objects.get(code=kind).id
+    except Kind.DoesNotExist:
+        raise InvalidInput(f"jenis {kind!r} tidak ada di registry") from None
+
+
+def _action_id(code):
+    try:
+        return Action.objects.get(code=code).id
+    except Action.DoesNotExist:
+        raise InvalidInput(f"aksi {code!r} tidak ada di registry") from None
+
+
+def default_member_check(association_id, member_id):
+    """Bawaan: `tenant.Member` punya kolom `association` (FK) dan pk = member_id.
+
+    Jika model Member Anda berbeda, atau butuh syarat tambahan (aktif / masih berlaku),
+    tulis fungsi `(association_id, member_id) -> bool` sendiri dan tunjuk lewat
+    settings.LEDGER_MEMBER_CHECK = "path.ke.fungsi".
+    """
+    Member = apps.get_model("tenant", "Member")
+    return Member.objects.filter(pk=member_id, association_id=association_id).exists()
+
+
+def _check_member(association_id, member_id):
+    """Member harus anggota association-nya. DB tidak bisa memeriksa ini (tanpa FK ke tenant)."""
+    if association_id is None or member_id is None:
+        raise InvalidInput("association dan member wajib diisi")
+    path = getattr(settings, "LEDGER_MEMBER_CHECK", None)
+    check = import_string(path) if path else default_member_check
+    if not check(association_id, member_id):
+        raise Forbidden("member ini bukan anggota association tersebut")
 
 
 def create_entry(issuer_id, issuer_member_id, reason, supply, metadata=None, kind=0):
     """Catat alasan + total supply. `kind`: kode registry ("pen") atau id; 0/"generic" = benda umum.
-    Item baru ada setelah mint_all()."""
+    Item baru ada setelah mint_all().
+    issuer_id = association penerbit; issuer_member_id = member yang membuat entry."""
+    _check_member(issuer_id, issuer_member_id)
     return _call("SELECT ledger_create_entry(%s, %s, %s, %s, %s::jsonb, %s::smallint)",
                  [issuer_id, issuer_member_id, reason, supply, json.dumps(metadata or {}), _kind_id(kind)])
 
 
-def mint_batch(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""): 
-    """Lahirkan hingga `batch` item berikutnya. Return jumlah dibuat (0 = supply penuh)."""
+def mint_batch(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
+    """Lahirkan hingga `batch` item berikutnya. Return jumlah dibuat (0 = supply penuh).
+    Member yang melahirkan dicatat di log seq 1 tiap item (boleh beda dari pembuat entry)."""
+    _check_member(issuer_id, issuer_member_id)
     return _call("SELECT ledger_mint_batch(%s, %s, %s, %s, %s)", [entry_id, issuer_id, issuer_member_id, batch, prefix])
 
 
-def mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""): 
+def mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
     """Mint seluruh supply. Tiap batch = transaksi sendiri (jangan panggil di dalam atomic() besar)."""
     total = 0
     while (n := mint_batch(entry_id, issuer_id, issuer_member_id, batch, prefix)):
@@ -83,7 +129,7 @@ def mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
     return total
 
 
-def create_item(issuer_id, issuer_member_id, reason, quantity, kind_code, metadata=None, prefix=""): 
+def create_item(issuer_id, issuer_member_id, reason, quantity, kind_code, metadata=None, prefix=""):
     """Buat `quantity` item sejenis (kode jenis dari registry: "pen", "letter", "stamp", ...).
     Return (entry_id, [collection_id, ...])."""
     with transaction.atomic():
@@ -98,6 +144,7 @@ def send(collection_id, actor_id, actor_member_id, payload=None):
     Pengirim tidak perlu tahu penerima. Buat QR dari token UUID yang dikembalikan;
     penerima scan QR lalu memanggil claim_transfer(token).
     """
+    _check_member(actor_id, actor_member_id)
     return _call("SELECT * FROM ledger_send(%s, %s, %s, %s::jsonb)",
                  [collection_id, actor_id, actor_member_id, _json(payload)], row=True)
 
@@ -106,8 +153,10 @@ def claim_transfer(token, actor_id, actor_member_id):
     """Penerima klaim transfer via token (dari scan QR). Kepemilikan langsung berpindah.
 
     token: UUID yang didapat dari QR code (dihasilkan oleh send()).
-    actor_id: user yang men-scan QR dan mengklaim item.
+    actor_id / actor_member_id: association penerima + member yang men-scan QR.
+    Item menjadi milik ASSOCIATION; member tercatat di log RECEIVE.
     """
+    _check_member(actor_id, actor_member_id)
     return _call("SELECT ledger_claim_transfer(%s, %s, %s)", [token, actor_id, actor_member_id])
 
 
@@ -117,7 +166,30 @@ def cancel_send(collection_id, actor_id, actor_member_id):
     Hanya pengirim (pemilik) yang boleh membatalkan. Di alur QR tidak ada
     'decline' oleh penerima — penerima memilih dengan tidak men-scan QR.
     """
+    _check_member(actor_id, actor_member_id)
     return _call("SELECT ledger_cancel_send(%s, %s, %s)", [collection_id, actor_id, actor_member_id])
+
+
+def assign(collection_id, actor_id, actor_member_id, new_holder_id=None):
+    """Tetapkan / ganti member pemegang item di dalam asosiasi yang sama.
+
+    Tidak memindahkan kepemilikan (owner tetap = Association).
+    Operasi ringan: langsung UPDATE kolom holder_id, tanpa menyentuh hash chain.
+
+    actor_id        : UUID association pemilik (harus = owner saat ini)
+    actor_member_id : UUID member yang menugaskan (admin / pemilik sebelumnya)
+    new_holder_id   : UUID member penerima; None/NULL = lepas dari pemegang
+
+    Contoh (analogi motor keluarga):
+        # Ayah (member A) meminjamkan motor ke kakak (member B)
+        assign(motor_collection_id, keluarga_id, ayah_member_id, kakak_member_id)
+
+        # Motor dikembalikan, belum ada pemegang
+        assign(motor_collection_id, keluarga_id, ayah_member_id, None)
+    """
+    _check_member(actor_id, actor_member_id)
+    return _call("SELECT ledger_assign(%s, %s, %s, %s)",
+                 [collection_id, actor_id, actor_member_id, new_holder_id])
 
 
 def use(collection_id, actor_id, actor_member_id, action_code=None, payload=None):
@@ -125,7 +197,8 @@ def use(collection_id, actor_id, actor_member_id, action_code=None, payload=None
     Aksi TUNGGAL oleh pemilik saat ini (mis. membaca surat, memakai stiker).
     Menghitung sebagai pemakaian alat -> tunduk pada kinds.max_as_tool.
     """
-    action_id = None if action_code is None else Action.objects.get(code=action_code).id
+    _check_member(actor_id, actor_member_id)
+    action_id = None if action_code is None else _action_id(action_code)
     return _call("SELECT ledger_use(%s, %s, %s, %s::smallint, %s::jsonb)",
                  [collection_id, actor_id, actor_member_id, action_id, _json(payload)])
 
@@ -137,7 +210,8 @@ def act(action_code, tool_id, target_id, actor_id, actor_member_id, content=None
     action_code  : kode aksi dari ledger_actions (mis. "write", "affix", "postmark")
     tool_id      : collection id alat (pena, perangko, cap pos, ...)
     target_id    : collection id sasaran (jurnal, surat, rol film, ...)
-    actor_id     : siapa yang melakukan aksi
+    actor_id     : ASSOCIATION pelaku (pemilik alat)
+    actor_member_id : member yang melakukannya (tercatat di KEDUA chain)
     content      : isi aksi (teks, foto, isi gelang pos, ...). Hanya sha256 masuk ledger.
     content_hash : alternatif jika sha256 dihitung sendiri.
     Return (seq_di_chain_alat, seq_di_chain_sasaran).
@@ -148,11 +222,11 @@ def act(action_code, tool_id, target_id, actor_id, actor_member_id, content=None
     - sasaran: tergantung target_access (1 milik pelaku | 2 sedang dikirim | 3 siapa pun aktif)
     - kapasitas: max_as_tool (alat) & max_as_target (sasaran) dari kinds
     """
+    _check_member(actor_id, actor_member_id)
     if content is not None:
         content_hash = content_sha256(content)
-    ac = Action.objects.get(code=action_code)
     return tuple(_call("SELECT * FROM ledger_act(%s::smallint, %s, %s, %s, %s, %s::bytea, %s::jsonb)",
-                       [ac.id, tool_id, target_id, actor_id, actor_member_id, content_hash, _json(payload)], row=True))
+                       [_action_id(action_code), tool_id, target_id, actor_id, actor_member_id, content_hash, _json(payload)], row=True))
 
 
 def content_sha256(content):
@@ -171,6 +245,12 @@ def item_history(collection_id):
     return Log.objects.filter(collection_id=collection_id).order_by("seq")
 
 
+def item_creator(collection_id):
+    """Log MINT (seq 1): `.actor_id` = association, `.actor_member_id` = member yang melahirkan item.
+    Terlindung hash chain, jadi bukti siapa pembuatnya tidak bisa ditulis ulang."""
+    return Log.objects.get(pk=(collection_id, 1))
+
+
 def item_uses(collection_id):
     """Aksi tunggal atau sisi alat dari aksi antar-item. `action_id` = kata kerja."""
     return item_history(collection_id).filter(event_type=Log.Event.USE).order_by("seq")
@@ -179,6 +259,21 @@ def item_uses(collection_id):
 def item_acted_on(collection_id):
     """Sisi sasaran dari aksi antar-item. Siapa melakukan apa dgn alat apa."""
     return item_history(collection_id).filter(event_type=Log.Event.ACTED_ON).order_by("seq")
+
+
+def item_assignments(collection_id):
+    """Seluruh riwayat pergantian pemegang (event ASSIGN).
+
+    Setiap log punya:
+      .actor        -> association yang mengassign
+      .actor_member -> member yang melakukan assignment
+      .payload      -> {"prev_holder": "<uuid|null>", "new_holder": "<uuid|null>"}
+      .created_at   -> kapan terjadi (tercatat di chain, tidak bisa diubah)
+
+    Karena masuk hash chain, riwayat ini bisa dibuktikan lewat build_proof().
+    """
+    return item_history(collection_id).filter(event_type=Log.Event.ASSIGN).order_by("seq")
+
 
 def verify_chain(collection_id):
     """Hitung ulang seluruh chain + replay aturan. Return (valid, broken_at_seq, detail)."""
@@ -358,7 +453,8 @@ def build_proof(collection_id, seq):
     keys = ["collection_id", "seq", "event_type", "actor_id", "actor_member_id", "counterparty_id", "created_us",
             "payload_text", "target_id", "target_seq", "action_id", "content_hash_hex"]
     log = dict(zip(keys, row[:12]))
-    leaf, prev = bytes(row[11]), bytes(row[12])
+    # row = 12 kolom log (0..11) + l.hash (12) + hash sebelumnya (13)
+    leaf, prev = bytes(row[12]), bytes(row[13])
     with connection.chunked_cursor() as cur:
         cur.execute(_LEAVES_SQL, [blk.window_start, blk.window_end])
         leaves = [bytes(r[0]) for r in cur]

@@ -6,6 +6,10 @@ yang memanggil fungsi PostgreSQL (atomik, 1 round-trip). Model di sini hanya
 untuk membaca/mengquery; save()/delete()/update() sengaja dilarang.
 
 Butuh Django >= 5.2 (CompositePrimaryKey).
+
+Identitas: association -> member -> user. Ledger hanya mengenal association (pemilik) dan
+member (yang bertindak); user tidak pernah masuk ledger. Semua FK ke tenant.* tanpa
+constraint fisik (db_constraint=False).
 """
 from django.db import models
 
@@ -37,12 +41,14 @@ class LedgerModel(models.Model):
 
 
 def _association_fk(**kw):
+    """Association = pemilik / pihak yang sah secara hukum. Tidak 'meninggal'."""
     # db_constraint=False: tanpa FK fisik (lihat catatan desain no.5 di schema)
     return models.ForeignKey("tenant.Association", on_delete=models.DO_NOTHING,
                              db_constraint=False, related_name="+", **kw)
 
 
 def _member_fk(**kw):
+    """Member = orang yang menekan tombolnya, atas nama association-nya (masuk ke hash)."""
     return models.ForeignKey("tenant.Member", on_delete=models.DO_NOTHING,
                              db_constraint=False, related_name="+", **kw)
 
@@ -119,7 +125,16 @@ class Entry(LedgerModel):
 
 
 class Collection(LedgerModel):
-    """Satu item (stiker #n, pena, surat, ...). Tidak pernah dibuat ulang / dihapus, hanya berpindah."""
+    """Satu item (stiker #n, pena, surat, ...). Tidak pernah dibuat ulang / dihapus, hanya berpindah.
+
+    Siapa (association + member) yang melahirkannya = log seq 1 (event MINT), terlindung hash:
+    lihat services.item_creator(). Entry.issuer / issuer_member = pembuat entry-nya.
+
+    owner   = Association pemilik SAH (punya 'BPKB'). Hanya berubah lewat transfer antar-asosiasi.
+    holder  = Member yang SEDANG MEMEGANG / MEMAKAI item ini di dalam asosiasi tersebut.
+              Boleh NULL (belum ditetapkan). Gunakan services.assign() untuk mengubahnya.
+              Analogi: 1 keluarga punya 4 motor -> tiap motor dipegang 1 anggota keluarga.
+    """
 
     class State(models.IntegerChoices):
         ACTIVE = 1, "aktif"
@@ -128,8 +143,8 @@ class Collection(LedgerModel):
     id = models.BigAutoField(primary_key=True)
     entry = models.ForeignKey(Entry, on_delete=models.DO_NOTHING, related_name="collections")
     serial_no = models.CharField(max_length=100)
-    issuer = _association_fk()
-    issuer_member = _member_fk()
+    owner = _association_fk()              # association pemilik SAAT INI; berubah tiap transfer
+    holder = _member_fk(null=True)         # member pemegang SAAT INI; NULL = belum ditugaskan
     state = models.SmallIntegerField(choices=State.choices)
     kind = models.ForeignKey(Kind, on_delete=models.DO_NOTHING, db_constraint=False,
                              db_column="kind", related_name="+")      # salinan beku entries.kind
@@ -148,12 +163,13 @@ class Log(LedgerModel):
     """Riwayat append-only. PK = (collection_id, seq). Tabel terbesar."""
 
     class Event(models.IntegerChoices):
-        MINT = 1, "lahir"
-        SEND = 2, "dikirim"
-        RECEIVE = 3, "diterima"
-        USE = 4, "dipakai (aksi tunggal, atau sisi ALAT dari aksi antar-item)"
+        MINT        = 1, "lahir"
+        SEND        = 2, "dikirim"
+        RECEIVE     = 3, "diterima"
+        USE         = 4, "dipakai (aksi tunggal, atau sisi ALAT dari aksi antar-item)"
         CANCEL_SEND = 5, "pengiriman dibatalkan pengirim"
-        ACTED_ON = 7, "dikenai aksi (sisi SASARAN dari aksi antar-item)"
+        ASSIGN      = 6, "pemegang diganti (di dalam asosiasi yang sama)"  # holder berubah; payload: prev/new
+        ACTED_ON    = 7, "dikenai aksi (sisi SASARAN dari aksi antar-item)"
 
     pk = models.CompositePrimaryKey("collection_id", "seq")
     collection = models.ForeignKey(Collection, on_delete=models.DO_NOTHING,
@@ -177,10 +193,10 @@ class Log(LedgerModel):
 
 
 class Holding(LedgerModel):
-    """Read-model: siapa memegang apa. Dipelihara oleh fungsi ledger_*."""
-    pk = models.CompositePrimaryKey("issuer_id", "issuer_member_id", "collection_id")
-    issuer = _association_fk()
-    issuer_member = _member_fk()
+    """Read-model: association mana memegang apa. Dipelihara oleh fungsi ledger_*.
+    Member penerima tidak disimpan di sini; ia ada di log RECEIVE."""
+    pk = models.CompositePrimaryKey("owner_id", "collection_id")
+    owner = _association_fk()
     collection = models.ForeignKey(Collection, on_delete=models.DO_NOTHING,
                                    db_constraint=False, related_name="+")
     entry = models.ForeignKey(Entry, on_delete=models.DO_NOTHING,

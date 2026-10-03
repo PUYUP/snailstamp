@@ -25,6 +25,18 @@
 --  transfer_tokens = token rahasia untuk klaim item (via QR)
 --  blocks       = checkpoint global (Merkle root per jendela waktu)
 --
+--  IDENTITAS:  association -> member -> user
+--    * KEPEMILIKAN menempel ke ASSOCIATION (entries.issuer_id, collections.owner_id,
+--      holdings.owner_id, logs.actor_id/counterparty_id, transfer_tokens.*_association_id),
+--      bukan ke user. Association tidak "meninggal": anggotanya boleh berganti, riwayat utuh.
+--    * Tiap tulis juga mencatat MEMBER yang bertindak (issuer_member_id / actor_member_id /
+--      from_member_id / claimed_by_member_id). Member masuk ke HASH -> tidak bisa ditulis ulang.
+--    * Ledger hanya menyimpan UUID. Apakah member itu benar anggota association-nya dicek di
+--      lapis aplikasi (services._check_member): tidak ada FK ke tabel tenant (prinsip no.5).
+--    * Pewarisan di dalam association = menambah member baru; tak ada yang ditulis ke ledger.
+--      Pewarisan ke association lain = send/claim biasa. Jangan HAPUS baris member (UUID-nya
+--      ada di hash); nonaktifkan saja.
+--
 --  Prinsip desain:
 --   1. Per-collection hash chain, BUKAN satu chain global.
 --      Chain global = antrean tunggal = tidak bisa scale. Per-collection chain
@@ -128,7 +140,8 @@ INSERT INTO ledger_kinds (id, code, label) VALUES (0, 'generic', 'benda umum');
 -- ---------------------------------------------------------------------
 CREATE TABLE ledger_entries (
     id            bigint      PRIMARY KEY DEFAULT nextval('ledger_entry_id_seq'),
-    issuer_id uuid      NOT NULL,
+    issuer_id        uuid     NOT NULL,                 -- association penerbit
+    issuer_member_id uuid     NOT NULL,                 -- member yang membuat entry
     reason        text        NOT NULL,                 -- alasan / landasan
     supply        integer     NOT NULL CHECK (supply > 0),  -- jumlah TOTAL yang boleh ada, selamanya
     kind          smallint    NOT NULL DEFAULT 0 REFERENCES ledger_kinds (id),
@@ -153,7 +166,9 @@ CREATE TABLE ledger_collections (
     id            bigint      NOT NULL DEFAULT nextval('ledger_collection_id_seq'),
     entry_id      bigint      NOT NULL REFERENCES ledger_entries (id),
     serial_no     varchar(100) NOT NULL,
-    owner_id uuid      NOT NULL,
+    owner_id      uuid        NOT NULL,                 -- association pemilik SAAT INI (berubah tiap transfer)
+    holder_id     uuid,                                -- member pemegang SAAT INI (dalam asosiasi yang sama)
+                                                      -- NULL = belum ditetapkan ke member tertentu
     state         smallint    NOT NULL DEFAULT 1 CHECK (state IN (1, 2)),  -- 1 aktif, 2 dalam pengiriman
     kind          smallint    NOT NULL,                                    -- salinan entries.kind (beku)
     last_seq      integer     NOT NULL,
@@ -161,8 +176,8 @@ CREATE TABLE ledger_collections (
     target_acts   integer     NOT NULL DEFAULT 0,   -- berapa kali dikenai aksi sebagai SASARAN
     last_hash     bytea       NOT NULL,
     created_at    timestamptz NOT NULL,
-    updated_at    timestamptz NOT NULL
-    PRIMARY KEY (id),
+    updated_at    timestamptz NOT NULL,
+    PRIMARY KEY (id)
 ) PARTITION BY HASH (id);
 
 -- ---------------------------------------------------------------------
@@ -172,13 +187,14 @@ CREATE TABLE ledger_collections (
 -- ---------------------------------------------------------------------
 CREATE TABLE ledger_logs (
     collection_id   bigint      NOT NULL,
-    actor_id uuid      NOT NULL,   -- pelaku
-    counterparty_id uuid,                 -- pihak lawan (tujuan kirim / asal terima)
+    actor_id        uuid        NOT NULL,   -- association pelaku
+    actor_member_id uuid        NOT NULL,   -- member yang bertindak atas nama association itu
+    counterparty_id uuid,                   -- association lawan (asal terima)
     target_id       bigint,                 -- USE/ACTED_ON: collection pasangan (alat<->sasaran)
     created_at      timestamptz NOT NULL,
     seq             integer     NOT NULL,   -- urutan per collection: 1,2,3,...
     target_seq      integer,                -- seq log pasangan di collection target
-    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 DECLINE_SEND, 7 ACTED_ON (sasaran)
+    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 (dicadangkan, tidak dipakai), 7 ACTED_ON (sasaran)
     action_id       smallint,               -- USE/ACTED_ON: kata kerja dari ledger_actions
     hash            bytea       NOT NULL,   -- sha256, 32 byte
     content_hash    bytea,                  -- ACTED_ON: sha256 isi (tulisan/foto/...). Isi asli di luar ledger
@@ -187,10 +203,10 @@ CREATE TABLE ledger_logs (
 ) PARTITION BY HASH (collection_id);
 
 -- ---------------------------------------------------------------------
--- 5. HOLDINGS  (hash-partition by owner_id) -- "item saya"
+-- 5. HOLDINGS  (hash-partition by owner_id) -- "item milik association ini"
 -- ---------------------------------------------------------------------
 CREATE TABLE ledger_holdings (
-    owner_id uuid      NOT NULL,
+    owner_id      uuid        NOT NULL,                 -- association pemilik
     collection_id bigint      NOT NULL,
     entry_id      bigint      NOT NULL,
     acquired_at   timestamptz NOT NULL,
@@ -198,15 +214,17 @@ CREATE TABLE ledger_holdings (
 ) PARTITION BY HASH (owner_id);
 
 -- ---------------------------------------------------------------------
--- 6. PENDING TRANSFERS (hash-partition by to_association_id) -- inbox penerima
+-- 6. TRANSFER TOKENS (tidak dipartisi) -- token QR; satu aktif per collection
 -- ---------------------------------------------------------------------
 CREATE TABLE ledger_transfer_tokens (
     token           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     collection_id   bigint      NOT NULL,
-    from_association_id uuid      NOT NULL,
+    from_association_id uuid    NOT NULL,
+    from_member_id  uuid        NOT NULL,               -- member pengirim
     created_at      timestamptz NOT NULL,
     expires_at      timestamptz,                  -- opsional: token kedaluwarsa
-    claimed_by_id uuid,                       -- NULL sampai diklaim
+    claimed_by_id   uuid,                         -- association penerima; NULL sampai diklaim
+    claimed_by_member_id uuid,                    -- member penerima;      NULL sampai diklaim
     claimed_at      timestamptz,                  -- NULL sampai diklaim
     CHECK ((claimed_by_id IS NULL) = (claimed_at IS NULL) AND (claimed_by_member_id IS NULL) = (claimed_by_id IS NULL))
 );
@@ -271,12 +289,7 @@ CREATE INDEX ledger_holdings_entry_idx ON ledger_holdings (owner_id, entry_id);
 CREATE INDEX ledger_transfer_tokens_from_idx ON ledger_transfer_tokens (from_association_id, created_at DESC);
 CREATE INDEX ledger_transfer_tokens_collection_idx ON ledger_transfer_tokens (collection_id, created_at DESC);
 
--- Immutability: kolom identitas beku
-CREATE TRIGGER ledger_transfer_tokens_frozen BEFORE UPDATE ON ledger_transfer_tokens
-  FOR EACH ROW
-  WHEN ((OLD.token, OLD.collection_id, OLD.from_association_id, OLD.from_member_id, OLD.created_at)
-        IS DISTINCT FROM (NEW.token, NEW.collection_id, NEW.from_association_id, NEW.from_member_id, NEW.created_at))
-  EXECUTE FUNCTION ledger_forbid_mutation();
+
 
 -- ---------------------------------------------------------------------
 -- 10. IMMUTABILITY (trigger row-level hanya "menyala" bila ada yang mencoba
@@ -286,6 +299,13 @@ CREATE FUNCTION ledger_forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '% pada % dilarang (append-only)', TG_OP, TG_TABLE_NAME USING ERRCODE = 'LG005';
 END $$;
+
+-- Immutability: kolom identitas beku
+CREATE TRIGGER ledger_transfer_tokens_frozen BEFORE UPDATE ON ledger_transfer_tokens
+  FOR EACH ROW
+  WHEN ((OLD.token, OLD.collection_id, OLD.from_association_id, OLD.from_member_id, OLD.created_at)
+        IS DISTINCT FROM (NEW.token, NEW.collection_id, NEW.from_association_id, NEW.from_member_id, NEW.created_at))
+  EXECUTE FUNCTION ledger_forbid_mutation();
 
 CREATE TRIGGER ledger_logs_append_only   BEFORE UPDATE OR DELETE ON ledger_logs
   FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
@@ -328,6 +348,16 @@ CREATE TRIGGER ledger_entries_frozen BEFORE UPDATE ON ledger_entries
 -- 11. FUNGSI TULIS (satu-satunya jalan menulis)
 -- ---------------------------------------------------------------------
 
+-- Association DAN member wajib ada. Tanpa ini NULL lolos diam-diam di perbandingan
+-- (NULL <> x = NULL) lalu gagal dengan galat NOT NULL yang membingungkan.
+CREATE FUNCTION ledger_require_actor(p_association uuid, p_member uuid) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF p_association IS NULL OR p_member IS NULL THEN
+    RAISE EXCEPTION 'association dan member wajib diisi' USING ERRCODE = 'LG004';
+  END IF;
+END $$;
+
 -- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.
 CREATE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
                                  p_counterparty uuid, p_payload jsonb, p_ts timestamptz,
@@ -355,6 +385,7 @@ CREATE FUNCTION ledger_create_entry(p_issuer uuid, p_issuer_member uuid, p_reaso
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_id bigint := nextval('ledger_entry_id_seq'); v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_issuer, p_issuer_member);
   IF p_supply IS NULL OR p_supply < 1 THEN
     RAISE EXCEPTION 'supply harus >= 1' USING ERRCODE = 'LG004';
   END IF;
@@ -383,6 +414,7 @@ CREATE FUNCTION ledger_mint_batch(p_entry_id bigint, p_issuer uuid, p_issuer_mem
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE e ledger_entries; v_from int; v_to int; v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_issuer, p_issuer_member);
   IF p_batch IS NULL OR p_batch < 1 OR p_batch > 100000 THEN
     RAISE EXCEPTION 'batch harus 1..100000' USING ERRCODE = 'LG004';
   END IF;
@@ -410,9 +442,9 @@ BEGIN
     FROM base b
     RETURNING collection_id, hash
   ), new_cols AS (
-    INSERT INTO ledger_collections (id, entry_id, serial_no, owner_id, state, kind,
+    INSERT INTO ledger_collections (id, entry_id, serial_no, owner_id, holder_id, state, kind,
                                     last_seq, last_hash, created_at, updated_at)
-    SELECT l.collection_id, e.id, b.serial_no, p_issuer, 1, e.kind, 1, l.hash, v_now, v_now
+    SELECT l.collection_id, e.id, b.serial_no, p_issuer, p_issuer_member, 1, e.kind, 1, l.hash, v_now, v_now
     FROM new_logs l JOIN base b ON b.id = l.collection_id
     RETURNING id
   )
@@ -430,6 +462,7 @@ CREATE FUNCTION ledger_send(p_collection_id bigint, p_actor uuid, p_actor_member
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; w record; v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
   SELECT * INTO c FROM ledger_collections WHERE id = p_collection_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'collection % tidak ada', p_collection_id USING ERRCODE = 'LG001'; END IF;
   IF c.owner_id <> p_actor THEN RAISE EXCEPTION 'anda bukan pemilik' USING ERRCODE = 'LG002'; END IF;
@@ -455,6 +488,7 @@ RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp 
 DECLARE
   t ledger_transfer_tokens; c ledger_collections; w record; v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
   SELECT * INTO t FROM ledger_transfer_tokens WHERE token = p_token FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'token transfer tidak ditemukan' USING ERRCODE = 'LG001'; END IF;
   IF t.claimed_by_id IS NOT NULL THEN RAISE EXCEPTION 'token sudah diklaim' USING ERRCODE = 'LG003'; END IF;
@@ -469,7 +503,7 @@ BEGIN
   SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now);
 
   UPDATE ledger_collections
-     SET owner_id = p_actor, state = 1,
+     SET owner_id = p_actor, holder_id = p_actor_member, state = 1,
          last_seq = w.new_seq, last_hash = w.new_hash, updated_at = v_now
    WHERE id = c.id;
 
@@ -489,6 +523,7 @@ CREATE FUNCTION ledger_cancel_send(p_collection_id bigint, p_actor uuid, p_actor
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; w record; v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
   SELECT * INTO c FROM ledger_collections WHERE id = p_collection_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'collection % tidak ada', p_collection_id USING ERRCODE = 'LG001'; END IF;
   IF c.state <> 2 THEN RAISE EXCEPTION 'tidak ada pengiriman yang menunggu' USING ERRCODE = 'LG003'; END IF;
@@ -500,7 +535,58 @@ BEGIN
      SET state = 1, last_seq = w.new_seq, last_hash = w.new_hash, updated_at = v_now
    WHERE id = c.id;
 
+  -- Kembalikan holder ke NULL (pengirim membatalkan; belum ada pemegang baru)
+  UPDATE ledger_collections SET holder_id = NULL WHERE id = c.id;
   DELETE FROM ledger_transfer_tokens WHERE collection_id = c.id AND claimed_by_id IS NULL;
+  RETURN w.new_seq;
+END $$;
+
+-- ASSIGN: tetapkan / ganti member pemegang di dalam asosiasi yang SAMA.
+-- Kepemilikan (owner_id) TIDAK berubah. Setiap pergantian pemegang dicatat
+-- sebagai event ASSIGN (type 6) di dalam hash chain -> permanen & bisa dibuktikan.
+-- Payload: {"prev_holder": "<uuid|null>", "new_holder": "<uuid|null>"}
+-- actor_id        = association pemilik (= owner_id)
+-- actor_member_id = member yang mengassign (misalnya admin keluarga)
+-- p_new_holder    = member penerima; NULL = lepas dari pemegang
+CREATE FUNCTION ledger_assign(
+  p_collection_id bigint,
+  p_actor         uuid,
+  p_actor_member  uuid,
+  p_new_holder    uuid          -- UUID member tujuan; NULL = lepas dari pemegang
+) RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  c       ledger_collections;
+  w       record;
+  v_now   timestamptz := clock_timestamp();
+  v_payload jsonb;
+BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
+  SELECT * INTO c FROM ledger_collections WHERE id = p_collection_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'collection % tidak ada', p_collection_id USING ERRCODE = 'LG001'; END IF;
+  IF c.owner_id <> p_actor THEN
+    RAISE EXCEPTION 'hanya pemilik association yang boleh menugaskan pemegang' USING ERRCODE = 'LG002';
+  END IF;
+  IF c.state <> 1 THEN
+    RAISE EXCEPTION 'tidak bisa mengubah pemegang saat item sedang dalam pengiriman' USING ERRCODE = 'LG003';
+  END IF;
+
+  -- Bangun payload: rekam siapa pemegang sebelumnya dan siapa penggantinya
+  v_payload := jsonb_build_object(
+    'prev_holder', c.holder_id::text,
+    'new_holder',  p_new_holder::text
+  );
+
+  -- Tulis ke chain sebagai event ASSIGN (6); counterparty = NULL
+  SELECT * INTO w FROM ledger_write_log(c, 6::smallint, p_actor, p_actor_member, NULL, v_payload, v_now);
+
+  -- Update kolom holder_id + last_seq/last_hash
+  UPDATE ledger_collections
+     SET holder_id  = p_new_holder,
+         last_seq   = w.new_seq,
+         last_hash  = w.new_hash,
+         updated_at = v_now
+   WHERE id = c.id;
+
   RETURN w.new_seq;
 END $$;
 
@@ -512,6 +598,7 @@ CREATE FUNCTION ledger_use(p_collection_id bigint, p_actor uuid, p_actor_member 
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; k ledger_kinds; w record; v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
   IF p_action IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_actions WHERE id = p_action) THEN
     RAISE EXCEPTION 'aksi % tidak ada di registry', p_action USING ERRCODE = 'LG004';
   END IF;
@@ -551,6 +638,7 @@ DECLARE
   kt ledger_kinds; kg ledger_kinds; wt record; wg record;
   v_now timestamptz := clock_timestamp();
 BEGIN
+  PERFORM ledger_require_actor(p_actor, p_actor_member);
   IF p_action IS NULL THEN RAISE EXCEPTION 'aksi wajib diisi' USING ERRCODE = 'LG004'; END IF;
   IF p_content_hash IS NOT NULL AND octet_length(p_content_hash) <> 32 THEN
     RAISE EXCEPTION 'content_hash harus sha256 (32 byte)' USING ERRCODE = 'LG004';
@@ -650,7 +738,9 @@ BEGIN
 
     v_err := NULL;                       -- replay aturan bisnis
     IF (r.seq = 1) <> (r.event_type = 1) THEN v_err := 'MINT harus tepat di seq 1';
-    ELSIF r.event_type = 1 THEN v_owner := r.actor_id;
+    ELSIF r.event_type = 1 THEN
+      IF r.actor_id <> e.issuer_id THEN v_err := 'MINT bukan oleh association penerbit entry'; END IF;
+      v_owner := r.actor_id;
     ELSIF r.event_type = 2 THEN
       IF v_state <> 1 OR v_owner <> r.actor_id THEN v_err := 'SEND tidak valid'; END IF;
       v_state := 2;
@@ -680,7 +770,8 @@ BEGIN
         IF NOT FOUND
            OR (r.event_type = 4 AND o.event_type <> 7) OR (r.event_type = 7 AND o.event_type <> 4)
            OR o.target_id IS DISTINCT FROM r.collection_id OR o.target_seq IS DISTINCT FROM r.seq
-           OR o.actor_id <> r.actor_id OR o.created_at <> r.created_at
+           OR o.actor_id <> r.actor_id OR o.actor_member_id <> r.actor_member_id
+           OR o.created_at <> r.created_at
            OR o.action_id IS DISTINCT FROM r.action_id THEN
           v_err := 'tautan pena<->jurnal tidak cocok (log pasangan hilang/berubah)';
         END IF;
@@ -707,7 +798,7 @@ END $$;
 --     Registry diubah lewat migrasi oleh role pemilik, bukan oleh aplikasi.
 --       CREATE ROLE ledger_app LOGIN PASSWORD '...';   -- sebelum migrasi
 -- ---------------------------------------------------------------------
-REVOKE EXECUTE ON FUNCTION ledger_write_log(ledger_collections, smallint, bigint, bigint, jsonb,
+REVOKE EXECUTE ON FUNCTION ledger_write_log(ledger_collections, smallint, uuid, uuid, uuid, jsonb,
                                             timestamptz, bigint, int, smallint, bytea) FROM PUBLIC;
 DO $$
 BEGIN
@@ -716,13 +807,13 @@ BEGIN
                     ledger_transfer_tokens, ledger_blocks,
                     ledger_kinds, ledger_actions, ledger_action_rules, ledger_kind_issuers TO ledger_app;
     GRANT INSERT ON ledger_blocks TO ledger_app;    -- sealer. Pisahkan ke role khusus bila perlu.
-    GRANT EXECUTE ON FUNCTION ledger_create_entry(bigint, text, int, jsonb, smallint),
-                              ledger_mint_batch(bigint, bigint, int),
-                              ledger_send(bigint, bigint, jsonb),
-                              ledger_claim_transfer(uuid, bigint),
-                              ledger_cancel_send(bigint, bigint),
-                              ledger_use(bigint, bigint, smallint, jsonb),
-                              ledger_act(smallint, bigint, bigint, bigint, bytea, jsonb),
+    GRANT EXECUTE ON FUNCTION ledger_create_entry(uuid, uuid, text, int, jsonb, smallint),
+                              ledger_mint_batch(bigint, uuid, uuid, int, varchar),
+                              ledger_send(bigint, uuid, uuid, jsonb),
+                              ledger_claim_transfer(uuid, uuid, uuid),
+                              ledger_cancel_send(bigint, uuid, uuid),
+                              ledger_use(bigint, uuid, uuid, smallint, jsonb),
+                              ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb),
                               ledger_verify_chain(bigint) TO ledger_app;
   END IF;
 END $$;
