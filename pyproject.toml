@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snailstamp"
+version = "0.1.0"
+description = "Enterprise-grade Django Project"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+dependencies = [
+    "Django>=6.1",
+    "djangorestframework>=3.15",
+    "django-allauth>=65.0",
+    "django-environ>=0.11",
+    "psycopg[binary,pool]>=3.3",
+    "celery>=5.4",
+    "redis>=5.0",
+    "gunicorn>=23.0",
+    "whitenoise>=6.7",
+    "cryptography>=50.0.2",
+    "PyNaCl>=1.6.2",
+    "django-guardian>=3.5.0",
+    "django-organizations>=2.7.0",
+    "drf-spectacular>=0.30.0",
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "django-debug-toolbar>=4.4",
+    "pytest>=8.0",
+    "pytest-django>=4.9",
+    "ruff>=0.6.0",
+    "black>=24.0",
+    "hatch>=1.18.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[project.scripts]
+"manage.py" = "snailstamp.manage:main"
