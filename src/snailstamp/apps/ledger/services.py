@@ -13,11 +13,13 @@ database lalu memverifikasi kepemilikan & state-machine sebagai lapis kedua.
 """
 import hashlib
 import json
+import os
 import struct
 from datetime import datetime, timedelta, timezone
 
 from django.apps import apps
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.db import DatabaseError, connection, transaction
 from django.utils.module_loading import import_string
 
@@ -319,6 +321,51 @@ def verify_chain(collection_id):
         return cur.fetchone()
 
 
+def reconstruct_collection(collection_id, seq=None):
+    """
+    Rekonstruksi state Collection dari log history.
+
+    Args:
+        collection_id: ID collection
+        seq: Seq log spesifik (None = state terkini)
+
+    Returns:
+        Dictionary yang merepresentasikan state Collection pada seq tersebut,
+        atau None jika log tidak ditemukan.
+
+    State snapshot menyimpan:
+        - id, entry_id, serial_no, owner_id, holder_id, state, kind
+        - last_seq, tool_uses, target_acts, last_hash
+        - created_at, updated_at
+    """
+    if seq is None:
+        # Ambil log terakhir (state terkini)
+        log = Log.objects.filter(collection_id=collection_id).order_by('-seq').first()
+    else:
+        log = Log.objects.filter(pk=(collection_id, seq)).first()
+
+    if log is None or log.state_snapshot is None:
+        return None
+
+    return log.state_snapshot
+
+
+def reconstruct_collection_full(collection_id):
+    """
+    Rekonstruksi seluruh history Collection dari semua log.
+
+    Returns:
+        List of (seq, event_type, state_snapshot) tuples,
+        ordered by seq ascending.
+    """
+    logs = Log.objects.filter(collection_id=collection_id).order_by('seq')
+    return [
+        (log.seq, log.event_type, log.state_snapshot)
+        for log in logs
+        if log.state_snapshot is not None
+    ]
+
+
 # ---------------------------------------------------------------- blocks
 # Setiap ~10 detik: Merkle root semua log di jendela waktu itu, ditautkan ke blok
 # sebelumnya. Tidak ada lock di jalur tulis; sealer membaca saja.
@@ -523,3 +570,208 @@ def verify_proof(proof):
         return expect.hex() == b["block_hash"] and b["start_us"] <= proof["log"]["created_us"] < b["end_us"]
     except (KeyError, ValueError):
         return False
+
+
+# ---------------------------------------------------------------- asset management
+# Fungsi untuk upload dan verifikasi file yang terkait dengan collection.
+# File disimpan dengan content-addressable storage (nama = hash) untuk deduplication.
+# Integritas diverifikasi lewat ledger (content_hash di log ACTED_ON).
+
+def _file_sha256(file_obj):
+    """Hitung SHA256 file. file_obj bisa berupa File object atau path string."""
+    hasher = hashlib.sha256()
+    if isinstance(file_obj, str):
+        with open(file_obj, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                hasher.update(chunk)
+    else:
+        # File object (Django UploadedFile)
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+        for chunk in iter(lambda: file_obj.read(8192), b''):
+            hasher.update(chunk)
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+    return hasher.digest()
+
+
+def _get_storage_path(content_hash, filename):
+    """Generate storage path berdasarkan hash (content-addressable)."""
+    hash_hex = content_hash.hex()
+    # Struktur: assets/ab/cdef1234567890... (2 karakter pertama sebagai folder)
+    return f"assets/{hash_hex[:2]}/{hash_hex}"
+
+
+def upload_asset(collection_id, actor_id, actor_member_id, file_obj,
+                 original_filename=None, mime_type=None, metadata=None,
+                 action_code="upload", replace_existing=False):
+    """
+    Upload file ke storage dan catat di ledger.
+
+    Args:
+        collection_id: ID collection yang terkait dengan file
+        actor_id: ID association pemilik collection
+        actor_member_id: ID member yang melakukan upload
+        file_obj: File object (Django UploadedFile) atau path file
+        original_filename: Nama asli file (opsional, akan diambil dari file_obj jika None)
+        mime_type: MIME type file (opsional, akan dideteksi jika None)
+        metadata: Dictionary metadata tambahan (opsional)
+        action_code: Kode aksi untuk log ledger (default: "upload")
+        replace_existing: Jika True, ganti asset lama yang active (jika ada)
+
+    Returns:
+        (asset_id, seq) - ID Asset yang dibuat dan seq log di ledger
+
+    Proses:
+        1. Hitung SHA256 file
+        2. Cek deduplication: jika file dengan hash sama sudah ada, skip upload
+        3. Upload ke storage dengan nama = hash (content-addressable)
+        4. Buat record Asset
+        5. Log ACTED_ON ke ledger dengan content_hash
+    """
+    _check_member(actor_id, actor_member_id)
+
+    # Hitung hash file
+    content_hash = _file_sha256(file_obj)
+    hash_hex = content_hash.hex()
+
+    # Ambil info file
+    if isinstance(file_obj, str):
+        if original_filename is None:
+            original_filename = file_obj.split('/')[-1]
+        file_size = os.path.getsize(file_obj)
+    else:
+        if original_filename is None:
+            original_filename = getattr(file_obj, 'name', 'unknown')
+        file_size = file_obj.size
+
+    # Upload ke storage (deduplication by hash)
+    storage_path = _get_storage_path(content_hash, original_filename)
+
+    # Cek apakah file sudah ada di storage
+    if not default_storage.exists(storage_path):
+        # Upload file baru
+        if isinstance(file_obj, str):
+            with open(file_obj, 'rb') as f:
+                default_storage.save(storage_path, f)
+        else:
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+            default_storage.save(storage_path, file_obj)
+            if hasattr(file_obj, 'seek'):
+                file_obj.seek(0)
+
+    # Import Asset model (delayed import untuk circular dependency)
+    from .assets import Asset
+
+    # Cek asset lama jika replace_existing
+    old_asset = None
+    if replace_existing:
+        old_asset = Asset.objects.filter(
+            collection_id=collection_id,
+            status=Asset.VersionStatus.ACTIVE
+        ).first()
+
+    # Buat record Asset
+    asset = Asset.objects.create(
+        collection_id=collection_id,
+        storage_path=storage_path,
+        content_hash=hash_hex,
+        original_filename=original_filename,
+        file_size=file_size,
+        mime_type=mime_type or 'application/octet-stream',
+        metadata=metadata or {},
+        uploaded_by_member_id=actor_member_id
+    )
+
+    # Update asset lama jika replace
+    if old_asset:
+        old_asset.status = Asset.VersionStatus.REPLACED
+        old_asset.replaces = asset
+        old_asset.save()
+
+    # Log ke ledger (ACTED_ON event)
+    payload = {
+        "asset_id": str(asset.id),
+        "original_filename": original_filename,
+        "file_size": file_size,
+        "mime_type": mime_type or 'application/octet-stream',
+    }
+    if metadata:
+        payload["metadata"] = metadata
+
+    seq = act(action_code, collection_id, collection_id, actor_id, actor_member_id,
+              content_hash=content_hash, payload=payload)[0]
+
+    return str(asset.id), seq
+
+
+def verify_asset(collection_id, seq, file_obj):
+    """
+    Verifikasi file sama dengan yang dicatat di ledger log ACTED_ON.
+
+    Args:
+        collection_id: ID collection
+        seq: Seq log ACTED_ON yang ingin diverifikasi
+        file_obj: File object atau path file yang ingin diverifikasi
+
+    Returns:
+        (valid, asset_id) - valid=True jika hash cocok, asset_id dari log payload
+    """
+    try:
+        log = Log.objects.get(pk=(collection_id, seq))
+    except Log.DoesNotExist:
+        return False, None
+
+    if log.event_type != Log.Event.ACTED_ON or log.content_hash is None:
+        return False, None
+
+    # Hitung hash file yang ingin diverifikasi
+    file_hash = _file_sha256(file_obj)
+
+    # Bandingkan dengan hash di ledger
+    if bytes(log.content_hash) != file_hash:
+        return False, None
+
+    # Ambil asset_id dari payload
+    asset_id = None
+    if log.payload:
+        asset_id = log.payload.get('asset_id')
+
+    return True, asset_id
+
+
+def get_asset(collection_id, version=None, status=None):
+    """
+    Ambil Asset untuk collection tertentu.
+
+    Args:
+        collection_id: ID collection
+        version: Versi spesifik (None = terbaru)
+        status: Filter status (None = semua)
+
+    Returns:
+        Asset object atau None
+    """
+    from .assets import Asset
+
+    qs = Asset.objects.filter(collection_id=collection_id)
+
+    if version is not None:
+        qs = qs.filter(version=version)
+    if status is not None:
+        qs = qs.filter(status=status)
+
+    return qs.order_by('-version').first()
+
+
+def get_asset_versions(collection_id):
+    """
+    Ambil semua versi asset untuk collection.
+
+    Returns:
+        QuerySet of Asset objects, ordered by version desc
+    """
+    from .assets import Asset
+
+    return Asset.objects.filter(collection_id=collection_id).order_by('-version')
