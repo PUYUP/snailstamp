@@ -194,7 +194,7 @@ CREATE TABLE ledger_logs (
     created_at      timestamptz NOT NULL,
     seq             integer     NOT NULL,   -- urutan per collection: 1,2,3,...
     target_seq      integer,                -- seq log pasangan di collection target
-    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 (dicadangkan, tidak dipakai), 7 ACTED_ON (sasaran)
+    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 ASSIGN, 7 ACTED_ON (sasaran)
     action_id       smallint,               -- USE/ACTED_ON: kata kerja dari ledger_actions
     hash            bytea       NOT NULL,   -- sha256, 32 byte
     content_hash    bytea,                  -- ACTED_ON: sha256 isi (tulisan/foto/...). Isi asli di luar ledger
@@ -593,12 +593,17 @@ END $$;
 -- USE: aksi TUNGGAL oleh pemilik SAAT INI (mis. membaca surat, memakai stiker).
 -- p_action opsional (kata kerja dari registry). Menghitung sebagai "pemakaian alat"
 -- sehingga tunduk pada kinds.max_as_tool. Aksi antar-dua-item memakai ledger_act().
+-- p_content_hash opsional: sha256 isi (foto/video/tulisan) yang dilampirkan pemilik; isi asli di luar ledger.
 CREATE FUNCTION ledger_use(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
-                           p_action smallint DEFAULT NULL, p_payload jsonb DEFAULT NULL)
+                           p_action smallint DEFAULT NULL, p_payload jsonb DEFAULT NULL,
+                           p_content_hash bytea DEFAULT NULL)
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; k ledger_kinds; w record; v_now timestamptz := clock_timestamp();
 BEGIN
   PERFORM ledger_require_actor(p_actor, p_actor_member);
+  IF p_content_hash IS NOT NULL AND octet_length(p_content_hash) <> 32 THEN
+    RAISE EXCEPTION 'content_hash harus sha256 (32 byte)' USING ERRCODE = 'LG004';
+  END IF;
   IF p_action IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ledger_actions WHERE id = p_action) THEN
     RAISE EXCEPTION 'aksi % tidak ada di registry', p_action USING ERRCODE = 'LG004';
   END IF;
@@ -612,7 +617,7 @@ BEGIN
   END IF;
 
   SELECT * INTO w FROM ledger_write_log(c, 4::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                        NULL, NULL, p_action, NULL);
+                                        NULL, NULL, p_action, p_content_hash);
   UPDATE ledger_collections
      SET last_seq = w.new_seq, last_hash = w.new_hash, tool_uses = tool_uses + 1, updated_at = v_now
    WHERE id = c.id;                       -- HOT update: tidak ada kolom ber-index yang berubah
@@ -711,7 +716,7 @@ LANGUAGE plpgsql STABLE AS $$
 DECLARE
   c ledger_collections; e ledger_entries; r ledger_logs; o ledger_logs;
   v_prev bytea; v_seq int := 0; v_err text;
-  v_owner uuid; v_state smallint := 1; v_tool int := 0; v_target int := 0;
+  v_owner uuid; v_holder uuid; v_state smallint := 1; v_tool int := 0; v_target int := 0;
 BEGIN
   SELECT * INTO c FROM ledger_collections WHERE id = p_collection_id;
   IF NOT FOUND THEN RETURN QUERY SELECT false, NULL::int, 'collection tidak ada'; RETURN; END IF;
@@ -740,19 +745,27 @@ BEGIN
     IF (r.seq = 1) <> (r.event_type = 1) THEN v_err := 'MINT harus tepat di seq 1';
     ELSIF r.event_type = 1 THEN
       IF r.actor_id <> e.issuer_id THEN v_err := 'MINT bukan oleh association penerbit entry'; END IF;
-      v_owner := r.actor_id;
+      v_owner := r.actor_id; v_holder := r.actor_member_id;      -- pembuat = pemegang pertama
     ELSIF r.event_type = 2 THEN
       IF v_state <> 1 OR v_owner <> r.actor_id THEN v_err := 'SEND tidak valid'; END IF;
       v_state := 2;
     ELSIF r.event_type = 3 THEN
       IF v_state <> 2 OR r.counterparty_id <> v_owner THEN v_err := 'RECEIVE tidak valid'; END IF;
-      v_owner := r.actor_id; v_state := 1;
+      v_owner := r.actor_id; v_state := 1; v_holder := r.actor_member_id;   -- penerima = pemegang
     ELSIF r.event_type = 4 THEN
       IF v_state <> 1 OR v_owner <> r.actor_id THEN v_err := 'USE tidak valid'; END IF;
       v_tool := v_tool + 1;
     ELSIF r.event_type = 5 THEN
       IF v_state <> 2 OR v_owner <> r.actor_id THEN v_err := 'CANCEL tidak valid'; END IF;
-      v_state := 1;
+      v_state := 1; v_holder := NULL;                            -- batal kirim = belum ada pemegang
+    ELSIF r.event_type = 6 THEN
+      IF v_state <> 1 OR v_owner <> r.actor_id THEN v_err := 'ASSIGN tidak valid';
+      ELSIF r.payload IS NULL OR NOT (r.payload ? 'prev_holder' AND r.payload ? 'new_holder') THEN
+        v_err := 'ASSIGN tanpa payload prev_holder/new_holder';
+      ELSIF (r.payload ->> 'prev_holder') IS DISTINCT FROM v_holder::text THEN
+        v_err := 'ASSIGN: prev_holder tidak sesuai riwayat';
+      END IF;
+      v_holder := (r.payload ->> 'new_holder')::uuid;
     ELSIF r.event_type = 7 THEN
       -- pelaku boleh bukan pemilik (rule target_access 2/3), jadi owner TIDAK dicek di sini;
       -- pasangannya (log USE di chain alat) yang mewajibkan pelaku = pemilik alat.
@@ -789,6 +802,9 @@ BEGIN
   IF v_owner <> c.owner_id OR v_state <> c.state THEN
     RETURN QUERY SELECT false, v_seq, 'state hasil replay tidak cocok dengan baris collections'; RETURN;
   END IF;
+  IF v_holder IS DISTINCT FROM c.holder_id THEN
+    RETURN QUERY SELECT false, v_seq, 'holder hasil replay tidak cocok dengan baris collections'; RETURN;
+  END IF;
   RETURN QUERY SELECT true, NULL::int, 'ok';
 END $$;
 
@@ -812,7 +828,8 @@ BEGIN
                               ledger_send(bigint, uuid, uuid, jsonb),
                               ledger_claim_transfer(uuid, uuid, uuid),
                               ledger_cancel_send(bigint, uuid, uuid),
-                              ledger_use(bigint, uuid, uuid, smallint, jsonb),
+                              ledger_use(bigint, uuid, uuid, smallint, jsonb, bytea),
+                              ledger_assign(bigint, uuid, uuid, uuid),
                               ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb),
                               ledger_verify_chain(bigint) TO ledger_app;
   END IF;

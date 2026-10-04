@@ -14,7 +14,13 @@ association ──< member >── user
 |---|---|---|
 | **Pemilik** | association | `entries.issuer_id`, `collections.owner_id`, `holdings.owner_id`, `logs.actor_id`, `logs.counterparty_id` |
 | **Pelaku** | member (atas nama association-nya) | `entries.issuer_member_id`, `logs.actor_member_id`, `transfer_tokens.from_member_id` / `claimed_by_member_id` |
+| **Pemegang** | member yang sedang memegang/memakai item di dalam association | `collections.holder_id` (read-model) + event `ASSIGN` |
 | **User** | orang di balik akun | **tidak pernah masuk ledger** |
+
+`owner` (association) tidak berubah ketika pemegang diganti; hanya transfer antar-association yang mengubahnya.
+Pemegang awal = member pembuat (MINT) atau penerima (RECEIVE); `cancel_send` mengosongkannya; `assign()`
+menggantinya dan menulis event ASSIGN (`prev_holder` / `new_holder`) ke chain. `verify_chain` me-replay semuanya
+dan menolak kolom `holder_id` yang tak sesuai riwayat.
 
 Kenapa: bila kepemilikan menempel ke user dan user meninggal, koleksinya terkunci. Dengan
 association, koleksi bisa dibagi (kakak, adik, kerabat) dan bisa diwariskan tanpa menyentuh riwayat:
@@ -51,12 +57,17 @@ View/API Anda tetap bertugas memastikan **user yang login memang pemegang member
 |---|---|
 | `create_item(issuer_id, issuer_member_id, alasan, jumlah, "pen")` | entry (alasan) + lahirkan item jenis tsb |
 | `send(coll, actor_id, actor_member_id)` / `claim_transfer(token, actor_id, actor_member_id)` / `cancel_send(...)` | kirim → terima (dua langkah; "dalam pengiriman" = surat di jalan) |
-| `use(coll, actor_id, actor_member_id, "read")` | aksi tunggal oleh pemilik |
+| `use(coll, actor_id, actor_member_id, "read")` | aksi tunggal oleh pemilik. Opsional `content=` / `content_hash=`: lampirkan sidik jari isi (foto, video, tulisan) |
+| `assign(coll, actor_id, actor_member_id, new_holder_id)` | ganti member pemegang di dalam association (`None` = lepas); `new_holder_id` wajib anggota association yang sama |
 | `act("write", alat, sasaran, actor_id, actor_member_id, content=...)` | dua item bertemu, dicatat di DUA chain |
-| `item_history / item_uses / item_acted_on / item_creator` | riwayat; `item_creator` = log MINT (association + member pembuat) |
+| `item_history / item_uses / item_acted_on / item_assignments / item_creator` | riwayat; `item_creator` = log MINT (association + member pembuat) |
 | `verify_chain`, `verify_blocks`, `build_proof` + `verify_proof` | audit; jalankan KEDUANYA secara berkala |
 
-Isi (teks, foto) tidak pernah masuk ledger, hanya sha256-nya (`verify_content`).
+Isi (teks, foto, video) tidak pernah masuk ledger, hanya sha256-nya. Untuk file besar hitung hash secara
+streaming: `sha256_stream(fileobj)` / `sha256_chunks(iterable)`, lalu beri ke `content_hash=`. `verify_content(coll, seq,
+content=... | content_hash=...)` berlaku untuk log USE maupun ACTED_ON.
+Penyimpanan file itu sendiri (S3, MediaObject, unduh, hapus): lihat app **`ledger_media`**.
+`check_member(association_id, member_id)` publik supaya app lain memakai aturan keanggotaan yang sama.
 Kesalahan: `NotFound` / `Forbidden` / `InvalidState` / `InvalidInput`.
 
 ## Menambah hobi baru = INSERT (tanpa ubah skema/kode)
@@ -75,8 +86,8 @@ VALUES (7, 12, 11, 1);                                            -- pensil meng
 
 ## Tes & reset
 * `python manage.py test snailstamp.apps.ledger` — skenario keluarga, otorisasi member, append-only,
-  deteksi penulisan ulang member, sealer + bukti Merkle. Tidak butuh data tenant.
-* Reset **development**: `sql/dev_reset.sql` (lihat petunjuk di dalamnya). Migrasi skema sengaja tidak
+  deteksi penulisan ulang member, replay holder/ASSIGN, lampiran hash, sealer + bukti Merkle. Tidak butuh data tenant.
+* Reset **development**: `sql/dev_reset.sql` (satu langkah; juga mengosongkan tabel `ledger_media` dan catatan migrasinya). Migrasi skema sengaja tidak
   bisa di-reverse: ledger production tidak boleh di-rollback.
 
 ## Batas yang disengaja

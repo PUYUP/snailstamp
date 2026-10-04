@@ -25,6 +25,6 @@ class EntryAdmin(ReadOnlyLedgerAdmin):
 
 @admin.register(Collection)
 class CollectionAdmin(ReadOnlyLedgerAdmin):
-    list_display = ("id", "serial_no", "entry_id", "owner_id", "state", "last_seq", "updated_at")
+    list_display = ("id", "serial_no", "entry_id", "owner_id", "holder_id", "state", "last_seq", "updated_at")
     search_fields = ("=serial_no",)       # exact match: LIKE '%..%' menyapu 64 partisi
     ordering = ("-id",)

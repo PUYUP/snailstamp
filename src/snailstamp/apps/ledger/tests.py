@@ -10,7 +10,6 @@ import hashlib
 import time
 import uuid
 from datetime import timedelta
-from unittest import skipUnless
 
 from django.db import DatabaseError, connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -42,6 +41,11 @@ class LedgerTestCase(TestCase):
         # pena + jurnal milik keluarga A, dibuat oleh ayah
         _, (self.pena,) = svc.create_item(self.fam_a, self.ayah, "pena warisan", 1, "pen")
         _, (self.jurnal,) = svc.create_item(self.fam_a, self.ayah, "jurnal keluarga", 1, "journal")
+
+    def require_superuser(self):
+        """Dicek saat tes berjalan (DB tes sudah ada), bukan saat modul diimpor."""
+        if not _is_superuser():
+            self.skipTest("perlu superuser untuk melewati trigger")
 
     def _actors(self, collection_id):
         return [(str(l.actor_id), str(l.actor_member_id)) for l in svc.item_history(collection_id)]
@@ -126,9 +130,9 @@ class ImmutabilityTests(LedgerTestCase):
             with self.assertRaises(DatabaseError), transaction.atomic(), connection.cursor() as cur:
                 cur.execute(sql)
 
-    @skipUnless(_is_superuser(), "perlu superuser untuk melewati trigger")
     def test_rewriting_the_member_in_history_is_detected(self):
         """Superuser DB bisa menimpa log (melewati trigger), tapi chain langsung rusak."""
+        self.require_superuser()
         svc.act("write", self.pena, self.jurnal, self.fam_a, self.ayah, content="asli")
         self.assertEqual(svc.verify_chain(self.jurnal), (True, None, "ok"))
         with connection.cursor() as cur:
@@ -296,3 +300,75 @@ class SerialNoTests(LedgerTestCase):
         self.assertTrue(col.serial_no.isdigit())
         self.assertGreaterEqual(len(col.serial_no), 8)
 
+
+
+class HolderReplayTests(LedgerTestCase):
+    """verify_chain me-replay holder: ASSIGN dikenali, dan kolom holder_id tak bisa dipalsukan."""
+
+    def test_holder_replay_across_mint_assign_send_receive(self):
+        svc.assign(self.pena, self.fam_a, self.ayah, self.kakak)
+        self.assertEqual(svc.verify_chain(self.pena), (True, None, "ok"))
+        _, token = svc.send(self.pena, self.fam_a, self.kakak)
+        svc.claim_transfer(token, self.fam_b, self.mem_b)           # penerima = pemegang baru
+        svc.assign(self.pena, self.fam_b, self.mem_b, None)
+        self.assertEqual(svc.verify_chain(self.pena), (True, None, "ok"))
+
+    def test_cancel_send_holder_reset_is_replayable(self):
+        _, token = svc.send(self.pena, self.fam_a, self.ayah)
+        svc.cancel_send(self.pena, self.fam_a, self.ayah)
+        self.assertIsNone(Collection.objects.get(pk=self.pena).holder_id)
+        self.assertEqual(svc.verify_chain(self.pena), (True, None, "ok"))
+
+    def test_forged_holder_column_is_detected(self):
+        with connection.cursor() as cur:        # pemilik skema bisa UPDATE kolom non-beku
+            cur.execute("UPDATE ledger_collections SET holder_id = %s WHERE id = %s", [self.kakak, self.pena])
+        valid, seq, detail = svc.verify_chain(self.pena)
+        self.assertFalse(valid)
+        self.assertIn("holder", detail)
+
+    def test_assign_to_member_of_another_association_is_refused(self):
+        before = Collection.objects.get(pk=self.pena).last_seq
+        with self.assertRaises(svc.Forbidden):
+            svc.assign(self.pena, self.fam_a, self.ayah, self.mem_b)    # mem_b anggota fam_b
+        self.assertEqual(Collection.objects.get(pk=self.pena).last_seq, before)
+
+    def test_forged_assign_payload_is_detected(self):
+        self.require_superuser()
+        svc.assign(self.pena, self.fam_a, self.ayah, self.kakak)
+        seq = Collection.objects.get(pk=self.pena).last_seq
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL session_replication_role = replica")
+            cur.execute("UPDATE ledger_logs SET payload = jsonb_build_object('prev_holder', NULL, 'new_holder', %s::text) "
+                        "WHERE collection_id = %s AND seq = %s", [str(self.mem_b), self.pena, seq])
+            cur.execute("SET LOCAL session_replication_role = DEFAULT")
+        valid, broken, _ = svc.verify_chain(self.pena)
+        self.assertEqual((valid, broken), (False, seq))                   # hash log tidak cocok
+
+
+class AttachContentTests(LedgerTestCase):
+    def test_use_records_content_hash_and_verify_content_accepts_use_logs(self):
+        seq = svc.use(self.jurnal, self.fam_a, self.ayah, "attach", payload={"media": "m1"}, content=b"foto-1")
+        log = Log.objects.get(pk=(self.jurnal, seq))
+        self.assertEqual((log.event_type, bytes(log.content_hash)), (Log.Event.USE, svc.content_sha256(b"foto-1")))
+        self.assertTrue(svc.verify_content(self.jurnal, seq, b"foto-1"))
+        self.assertFalse(svc.verify_content(self.jurnal, seq, b"foto-2"))
+        self.assertTrue(svc.verify_content(self.jurnal, seq, content_hash=svc.content_sha256(b"foto-1")))
+        self.assertEqual(svc.verify_chain(self.jurnal), (True, None, "ok"))
+
+    def test_content_hash_must_be_sha256(self):
+        with self.assertRaises(svc.InvalidInput), transaction.atomic():
+            svc.use(self.jurnal, self.fam_a, self.ayah, "attach", content_hash=b"terlalu-pendek")
+
+    def test_verify_content_needs_exactly_one_argument(self):
+        with self.assertRaises(svc.InvalidInput):
+            svc.verify_content(self.jurnal, 1)
+        with self.assertRaises(svc.InvalidInput):
+            svc.verify_content(self.jurnal, 1, b"x", svc.content_sha256(b"x"))
+
+    def test_streaming_hash_equals_in_memory_hash(self):
+        import io
+        for size in (0, 1, 1023, 1024, 1025, 10_000):
+            data = bytes(range(256)) * (size // 256) + bytes(range(size % 256))
+            self.assertEqual(svc.sha256_stream(io.BytesIO(data), chunk_size=1024), svc.content_sha256(data))
+            self.assertEqual(svc.sha256_chunks(data[i:i + 700] for i in range(0, len(data), 700)),
+                             svc.content_sha256(data))

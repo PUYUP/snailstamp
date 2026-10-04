@@ -95,14 +95,18 @@ def default_member_check(association_id, member_id):
     return Member.objects.filter(pk=member_id, association_id=association_id).exists()
 
 
-def _check_member(association_id, member_id):
-    """Member harus anggota association-nya. DB tidak bisa memeriksa ini (tanpa FK ke tenant)."""
+def check_member(association_id, member_id):
+    """Member harus anggota association-nya. DB tidak bisa memeriksa ini (tanpa FK ke tenant).
+    Publik supaya app lain (mis. ledger_media) memakai aturan yang SAMA persis."""
     if association_id is None or member_id is None:
         raise InvalidInput("association dan member wajib diisi")
     path = getattr(settings, "LEDGER_MEMBER_CHECK", None)
     check = import_string(path) if path else default_member_check
     if not check(association_id, member_id):
         raise Forbidden("member ini bukan anggota association tersebut")
+
+
+_check_member = check_member
 
 
 def create_entry(issuer_id, issuer_member_id, reason, supply, metadata=None, kind=0):
@@ -174,11 +178,13 @@ def assign(collection_id, actor_id, actor_member_id, new_holder_id=None):
     """Tetapkan / ganti member pemegang item di dalam asosiasi yang sama.
 
     Tidak memindahkan kepemilikan (owner tetap = Association).
-    Operasi ringan: langsung UPDATE kolom holder_id, tanpa menyentuh hash chain.
+    Dicatat sebagai event ASSIGN di hash chain (payload: prev_holder / new_holder), jadi
+    siapa memegang item kapan bisa dibuktikan lewat verify_chain / build_proof.
 
     actor_id        : UUID association pemilik (harus = owner saat ini)
     actor_member_id : UUID member yang menugaskan (admin / pemilik sebelumnya)
-    new_holder_id   : UUID member penerima; None/NULL = lepas dari pemegang
+    new_holder_id   : UUID member penerima (harus anggota association yang sama);
+                      None/NULL = lepas dari pemegang
 
     Contoh (analogi motor keluarga):
         # Ayah (member A) meminjamkan motor ke kakak (member B)
@@ -188,19 +194,28 @@ def assign(collection_id, actor_id, actor_member_id, new_holder_id=None):
         assign(motor_collection_id, keluarga_id, ayah_member_id, None)
     """
     _check_member(actor_id, actor_member_id)
+    if new_holder_id is not None:
+        _check_member(actor_id, new_holder_id)      # DB tak bisa tahu keanggotaan: cek di sini
     return _call("SELECT ledger_assign(%s, %s, %s, %s)",
                  [collection_id, actor_id, actor_member_id, new_holder_id])
 
 
-def use(collection_id, actor_id, actor_member_id, action_code=None, payload=None):
+def use(collection_id, actor_id, actor_member_id, action_code=None, payload=None,
+        content=None, content_hash=None):
     """
-    Aksi TUNGGAL oleh pemilik saat ini (mis. membaca surat, memakai stiker).
+    Aksi TUNGGAL oleh pemilik saat ini (mis. membaca surat, memakai stiker, melampirkan foto).
     Menghitung sebagai pemakaian alat -> tunduk pada kinds.max_as_tool.
+
+    content      : isi kecil (str/bytes) yang di-hash di sini.
+    content_hash : sha256 (32 byte) yang Anda hitung sendiri, mis. dengan sha256_stream() untuk
+                   file besar. Isi asli TIDAK pernah masuk ledger; hanya hash-nya.
     """
     _check_member(actor_id, actor_member_id)
+    if content is not None:
+        content_hash = content_sha256(content)
     action_id = None if action_code is None else _action_id(action_code)
-    return _call("SELECT ledger_use(%s, %s, %s, %s::smallint, %s::jsonb)",
-                 [collection_id, actor_id, actor_member_id, action_id, _json(payload)])
+    return _call("SELECT ledger_use(%s, %s, %s, %s::smallint, %s::jsonb, %s::bytea)",
+                 [collection_id, actor_id, actor_member_id, action_id, _json(payload), content_hash])
 
 
 def act(action_code, tool_id, target_id, actor_id, actor_member_id, content=None, content_hash=None, payload=None):
@@ -233,11 +248,33 @@ def content_sha256(content):
     return hashlib.sha256(content.encode("utf-8") if isinstance(content, str) else content).digest()
 
 
-def verify_content(collection_id, seq, content):
-    """Benarkah `content` ini yang dulu dicatat pada log ACTED_ON (collection_id, seq)?"""
+def sha256_stream(fileobj, chunk_size=1 << 20):
+    """sha256 dari file-like (.read) tanpa memuat seluruhnya ke memori: aman untuk video."""
+    h = hashlib.sha256()
+    for block in iter(lambda: fileobj.read(chunk_size), b""):
+        h.update(block)
+    return h.digest()
+
+
+def sha256_chunks(chunks):
+    """sha256 dari iterable potongan bytes (mis. body streaming S3)."""
+    h = hashlib.sha256()
+    for block in chunks:
+        h.update(block)
+    return h.digest()
+
+
+def verify_content(collection_id, seq, content=None, content_hash=None):
+    """Benarkah isi ini yang dulu dicatat pada log (collection_id, seq)?
+
+    Beri `content` (str/bytes) ATAU `content_hash` (hasil sha256_stream untuk file besar).
+    Berlaku untuk log USE (lampiran pemilik) dan ACTED_ON (sasaran suatu aksi)."""
+    if (content is None) == (content_hash is None):
+        raise InvalidInput("beri tepat satu dari content atau content_hash")
     log = Log.objects.get(pk=(collection_id, seq))
-    return (log.event_type == Log.Event.ACTED_ON and log.content_hash is not None
-            and bytes(log.content_hash) == content_sha256(content))
+    want = content_sha256(content) if content is not None else bytes(content_hash)
+    return (log.event_type in (Log.Event.USE, Log.Event.ACTED_ON) and log.content_hash is not None
+            and bytes(log.content_hash) == want)
 
 
 def item_history(collection_id):

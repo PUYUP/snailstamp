@@ -22,7 +22,8 @@ INSERT INTO ledger_actions (id, code, label) VALUES
   (3, 'postmark', 'mengecap pos'),
   (4, 'expose',   'memotret'),
   (5, 'play',     'memutar'),
-  (6, 'read',     'membaca')          -- aksi tunggal: dipakai lewat ledger_use
+  (6, 'read',     'membaca'),         -- aksi tunggal: dipakai lewat ledger_use
+  (7, 'attach',   'melampirkan media')  -- aksi tunggal: foto/video dilampirkan pemilik (ledger_media)
 ON CONFLICT (id) DO NOTHING;
 
 -- target_access: 1 pemilik sasaran | 2 siapa pun saat sasaran DIKIRIM | 3 siapa pun, sasaran aktif
