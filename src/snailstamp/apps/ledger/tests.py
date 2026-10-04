@@ -8,25 +8,38 @@ diganti fungsi palsu di bawah lewat settings.LEDGER_MEMBER_CHECK.
 """
 import hashlib
 import itertools
+import json
 import os
+import threading
 import time
 import uuid
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import skipUnless
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import DatabaseError, connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone as dj_timezone
 from nacl import signing as nacl_signing
 
+from . import anchors, shamir
 from . import services as svc
-from . import shamir
-from .models import (BlockSignature, Collection, Entry, Holding, LedgerWriteForbidden, Log, SealerKey,
-                     SealerKeyAuditLog)
+from .models import (
+    BlockAnchor,
+    BlockSignature,
+    Collection,
+    Entry,
+    Holding,
+    LedgerWriteForbidden,
+    Log,
+    SealerKey,
+    SealerKeyAuditLog,
+)
 
 _MEMBERS = {}          # association_id -> {member_id, ...}
 
@@ -155,7 +168,9 @@ class SealerAndProofTests(LedgerTestCase):
     def test_blocks_and_proofs_cover_member_data(self):
         svc.act("write", self.pena, self.jurnal, self.fam_a, self.ayah, content="catatan")
         time.sleep(2.2)                                              # lewati jendela 1 dtk
-        while svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0)):
+        private, public = svc.generate_sealer_keypair()
+        keys = [{"sealer_id": svc.register_sealer("sealer-1", public).id, "private_key": private}]
+        while svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0), sealer_private_keys=keys):
             pass
         self.assertEqual(svc.verify_blocks(), (True, None))
         for coll, seq in ((self.jurnal, 1), (self.jurnal, 2), (self.pena, 2)):
@@ -532,3 +547,188 @@ class SealerShamirServiceTests(SealerKeyTestCase):
         recovered = svc.recover_sealer_private_key(sealer.id, shares)
         block = self._seal([{"sealer_id": sealer.id, "private_key": recovered}])
         self.assertEqual(svc.verify_block_signatures(block), (True, 1))
+
+
+class SignatureEnforcementTests(SealerKeyTestCase):
+    def test_unsigned_or_unregistered_sealing_is_refused(self):
+        svc.create_entry(self.assoc, self.member, "uji", 1)
+        with self.assertRaises(svc.InvalidInput):
+            svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0))
+        rogue_private, _ = svc.generate_sealer_keypair()
+        with self.assertRaises(svc.InvalidInput):
+            svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0),
+                                sealer_private_keys=rogue_private)
+        self.assertFalse(svc.Block.objects.exists())
+
+    def test_legacy_key_without_sealer_id_is_resolved_by_public_key(self):
+        sealer, private = self._sealer("sealer-1")
+        block = self._seal(private)
+        self.assertEqual(block.signatures[0]["sealer_id"], str(sealer.id))
+        self.assertEqual(svc.verify_blocks(), (True, None))
+
+    def test_unsigned_block_fails_verification(self):
+        with override_settings(LEDGER_REQUIRE_BLOCK_SIGNATURES=False):
+            self._seal()
+            self.assertEqual(svc.verify_blocks(), (True, None))
+        self.assertEqual(svc.verify_blocks(), (False, 1))
+
+
+def _anchor_settings(path):
+    return override_settings(LEDGER_ANCHOR_INTERVAL=1, LEDGER_ANCHOR_BACKENDS=[
+        {"NAME": "file", "BACKEND": "snailstamp.apps.ledger.anchors.FileAnchorBackend",
+         "OPTIONS": {"path": str(path)}}])
+
+
+class AnchorAndForkDetectionTests(SealerKeyTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "anchors.jsonl"
+        self.settings_cm = _anchor_settings(self.path)
+        self.settings_cm.enable()
+        self.sealer, self.private = self._sealer("sealer-1", region="ap-southeast-3")
+        self.keys = [{"sealer_id": self.sealer.id, "private_key": self.private}]
+
+    def tearDown(self):
+        self.settings_cm.disable()
+        self.tmp.cleanup()
+
+    def _tamper(self, sql, params):
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL session_replication_role = replica")
+            cur.execute(sql, params)
+            cur.execute("SET LOCAL session_replication_role = DEFAULT")
+
+    def test_anchor_publishes_signed_checkpoint_and_respects_interval(self):
+        block = self._seal(self.keys)
+        (anchor,) = svc.anchor_blocks()
+        self.assertEqual((anchor.block_no, anchor.backend), (block.block_no, "file"))
+        (line,) = self.path.read_text().splitlines()
+        cp = json.loads(line)
+        self.assertEqual(cp["block_hash"], bytes(block.block_hash).hex())
+        self.assertEqual(cp["signatures"][0]["public_key"], self.sealer.public_key)
+        self.assertEqual(svc.anchor_blocks(), [])                  # belum ada blok baru
+        self.assertEqual(svc.detect_forks(), [])
+        with override_settings(LEDGER_ANCHOR_INTERVAL=1000):
+            self._seal(self.keys)
+            self.assertEqual(svc.anchor_blocks(), [])              # belum sampai interval
+            self.assertEqual(len(svc.anchor_blocks(force=True)), 1)
+        with self.assertRaises(LedgerWriteForbidden):
+            BlockAnchor.objects.all().delete()
+
+    def test_broken_chain_is_never_anchored(self):
+        self._seal(self.keys)
+        SealerKey.objects.filter(pk=self.sealer.pk).update(status=SealerKey.KeyStatus.REVOKED)
+        with self.assertRaises(svc.InvalidState):
+            svc.anchor_blocks()
+        self.assertFalse(self.path.exists())
+
+    @skipUnless(_is_superuser(), "perlu superuser untuk melewati trigger")
+    def test_rewrite_and_rollback_are_detected(self):
+        block = self._seal(self.keys)
+        svc.anchor_blocks()
+        forged = hashlib.sha256(b"riwayat palsu").digest()
+        self._tamper("UPDATE ledger_blocks SET block_hash = %s WHERE block_no = %s", [forged, block.block_no])
+        kinds = {f.kind for f in svc.detect_forks()}
+        self.assertEqual(kinds, {"hash_mismatch", "chain_invalid"})
+        self._tamper("DELETE FROM ledger_blocks WHERE block_no = %s", [block.block_no])
+        self.assertIn("missing_block", {f.kind for f in svc.detect_forks()})
+
+    @skipUnless(_is_superuser(), "perlu superuser untuk melewati trigger")
+    def test_equivocation_by_sealer_key_is_detected(self):
+        """Pencuri key menulis ulang blok DAN menandatanganinya ulang: chain di DB konsisten lagi,
+        tapi checkpoint lama membuktikan key yang sama menandatangani dua riwayat."""
+        block = self._seal(self.keys)
+        svc.anchor_blocks()
+        b = svc.Block.objects.get(pk=block.block_no)
+        new_end = b.window_end + timedelta(microseconds=1)
+        new_hash = svc._block_hash(bytes(b.prev_block_hash), bytes(b.merkle_root), b.window_start, new_end,
+                                   b.log_count)
+        sig = nacl_signing.SigningKey(bytes.fromhex(self.private)).sign(new_hash).signature.hex()
+        sigs = [{"sealer_id": str(self.sealer.id), "public_key": self.sealer.public_key, "signature": sig}]
+        self._tamper("UPDATE ledger_blocks SET window_end = %s, block_hash = %s, signatures = %s::jsonb "
+                     "WHERE block_no = %s", [new_end, new_hash, json.dumps(sigs), b.block_no])
+        findings = svc.detect_forks()
+        self.assertEqual([f.kind for f in findings], ["equivocation"])
+        self.assertIn(self.sealer.public_key, findings[0].detail)
+
+    def test_forged_checkpoint_and_corrupt_backend_are_reported(self):
+        block = self._seal(self.keys)
+        forged = anchors.Checkpoint(block_no=block.block_no, block_hash="00" * 32,
+                                    prev_block_hash="00" * 32, window_end_us=0,
+                                    signatures=[{"public_key": self.sealer.public_key, "signature": "00" * 64}])
+        anchors.FileAnchorBackend("file", path=str(self.path)).publish(forged)
+        self.assertEqual([f.kind for f in svc.detect_forks()], ["invalid_checkpoint"])
+        with self.path.open("a") as fh:
+            fh.write("bukan json\n")
+        self.assertEqual([f.kind for f in svc.detect_forks()], ["backend_error"])
+
+    def test_conflicting_backends_are_reported(self):
+        self._seal(self.keys)
+        other = Path(self.tmp.name) / "other.jsonl"
+        backends = [anchors.FileAnchorBackend("a", path=str(self.path)),
+                    anchors.FileAnchorBackend("b", path=str(other))]
+        svc.anchor_blocks(backends=backends)
+        cp = json.loads(other.read_text())
+        cp["block_hash"] = "11" * 32                               # tanpa signature valid -> ditolak
+        other.write_text(json.dumps(cp) + "\n")
+        self.assertEqual([f.kind for f in svc.detect_forks(backends=backends)], ["invalid_checkpoint"])
+        cp["signatures"][0]["signature"] = nacl_signing.SigningKey(bytes.fromhex(self.private)).sign(
+            bytes.fromhex(cp["block_hash"])).signature.hex()       # key yang sama menandatangani versi lain
+        other.write_text(json.dumps(cp) + "\n")
+        kinds = sorted(f.kind for f in svc.detect_forks(backends=backends))
+        self.assertEqual(kinds, ["anchor_conflict", "equivocation"])
+        self.assertEqual(svc.detect_forks(backends=backends[:1]), [])
+
+    def test_http_backend_roundtrip(self):
+        store, seen_auth = [], []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen_auth.append(self.headers.get("Authorization"))
+                store.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self._reply(f"receipt-{len(store)}")
+
+            def do_GET(self):
+                self._reply(json.dumps(store))
+
+            def _reply(self, text):
+                body = text.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            backend = anchors.HttpAnchorBackend("notary", url=f"http://127.0.0.1:{server.server_port}/",
+                                                token_env="ANCHOR_TOKEN")
+            self._seal(self.keys)
+            with _env(ANCHOR_TOKEN="rahasia"):
+                (anchor,) = svc.anchor_blocks(backends=[backend])
+            self.assertEqual((anchor.receipt, seen_auth), ("receipt-1", ["Bearer rahasia"]))
+            self.assertEqual(svc.detect_forks(backends=[backend]), [])
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual([f.kind for f in svc.detect_forks(backends=[backend])], ["backend_error"])
+
+    def test_commands(self):
+        self._seal(self.keys)
+        out = StringIO()
+        call_command("anchor_ledger", "--once", stdout=out)
+        self.assertEqual(json.loads(out.getvalue())["backend"], "file")
+        out = StringIO()
+        call_command("check_forks", stdout=out)
+        self.assertIn("OK", out.getvalue())
+        cp = json.loads(self.path.read_text())
+        cp["block_no"] += 100                                      # checkpoint untuk blok yang "hilang"
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(cp) + "\n")
+        with self.assertRaises(CommandError):
+            call_command("check_forks", stdout=StringIO(), stderr=StringIO())
+

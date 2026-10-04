@@ -547,6 +547,76 @@ python manage.py sealer_shamir check --sealer-id <ID> --share-file a.txt --share
 python manage.py cosign_ledger --sealer-id <ID> --share-file a.txt --share-file b.txt --share-file c.txt
 ```
 
+## Signature Wajib & Anchoring (Fork Detection)
+
+### Signature wajib
+
+`LEDGER_REQUIRE_BLOCK_SIGNATURES` (default `True`):
+
+* `seal_next_block()` menolak menyegel tanpa key, atau dengan key yang bukan milik `SealerKey` aktif
+  terdaftar (`InvalidInput`). Key legacy tanpa `sealer_id` dicocokkan lewat public key.
+* `verify_blocks()` menganggap blok tanpa signature valid sebagai rusak. Superuser DB yang menulis
+  ulang chain sekarang juga butuh private key sealer (yang bisa dipecah dengan Shamir).
+
+### Anchoring checkpoint ke luar DB
+
+Superuser DB + pencuri key masih bisa membangun chain baru yang konsisten. Pertahanannya: secara
+berkala terbitkan **checkpoint** blok terbaru ke penyimpanan di luar database
+(`ledger/anchors.py`). Checkpoint = `block_no`, `block_hash`, `prev_block_hash`, `window_end_us`, dan
+semua signature sealer atas blok itu. Karena `block_hash` mengikat seluruh blok sebelumnya, satu
+checkpoint mengunci seluruh riwayat sampai titik itu.
+
+```python
+# settings
+LEDGER_ANCHOR_INTERVAL = 100                     # anchor tiap 100 blok (~17 menit @10 dtk)
+LEDGER_ANCHOR_BACKENDS = [
+    {"NAME": "worm", "BACKEND": "snailstamp.apps.ledger.anchors.FileAnchorBackend",
+     "OPTIONS": {"path": "/mnt/worm/snailstamp-anchors.jsonl"}},
+    {"NAME": "notary", "BACKEND": "snailstamp.apps.ledger.anchors.HttpAnchorBackend",
+     "OPTIONS": {"url": "https://notary.example.com/anchors", "token_env": "LEDGER_ANCHOR_TOKEN"}},
+]
+```
+
+Atau lewat env (`core/settings/base.py`): `LEDGER_ANCHOR_FILE`, `LEDGER_ANCHOR_URL` (+ `LEDGER_ANCHOR_TOKEN`),
+`LEDGER_ANCHOR_INTERVAL`, `LEDGER_REQUIRE_BLOCK_SIGNATURES`.
+
+* `FileAnchorBackend` — satu baris JSON per checkpoint (append + fsync). Taruh di volume yang TIDAK
+  bisa ditulis oleh operator DB: WORM / S3 Object Lock yang di-mount / replika off-site.
+* `HttpAnchorBackend` — `POST url` (body = checkpoint JSON, respons = receipt) dan `GET url`
+  (JSON array semua checkpoint). Cocok untuk layanan notaris / region lain / pihak ketiga.
+* Backend lain (OpenTimestamps, transparency log, ...): turunkan `AnchorBackend`, implementasikan
+  `publish()` dan `checkpoints()`.
+
+`anchor_blocks()` memverifikasi ulang chain (termasuk signature) sejak anchor terakhir sebelum
+menerbitkan, jadi ledger yang sudah rusak tidak pernah di-anchor. Tabel `ledger_block_anchors`
+(`BlockAnchor`, append-only) hanya indeks lokal; deteksi selalu membaca dari backend eksternal.
+
+### Deteksi fork
+
+```python
+from snailstamp.apps.ledger.services import anchor_blocks, detect_forks
+
+anchor_blocks()                     # biasanya lewat command anchor_ledger
+for f in detect_forks():            # [] = DB cocok dengan semua checkpoint
+    print(f.kind, f.block_no, f.backend, f.detail)
+```
+
+| `kind` | Arti |
+|---|---|
+| `missing_block` | Blok yang pernah di-anchor tidak ada lagi di DB (rollback / truncate) |
+| `hash_mismatch` | `block_hash` di DB berbeda dari checkpoint (riwayat ditulis ulang) |
+| `equivocation` | Key sealer yang sama menandatangani dua versi blok yang sama -> key bocor / sealer curang |
+| `anchor_conflict` | Dua backend menyimpan checkpoint berbeda untuk blok yang sama |
+| `invalid_checkpoint` | Checkpoint tanpa signature valid dari sealer terdaftar (backend dirusak) |
+| `chain_invalid` | `verify_blocks()` gagal (Merkle / tautan / signature) |
+| `backend_error` | Backend tidak bisa dibaca / isinya rusak |
+
+```bash
+python manage.py anchor_ledger              # service: anchor tiap --sleep detik (default 60)
+python manage.py anchor_ledger --once --force
+python manage.py check_forks                # exit code != 0 bila ada temuan -> pasang di cron/monitoring
+```
+
 ## Performance Impact
 
 - **Signing**: ~0.1ms per signature (Ed25519 sangat cepat)
@@ -580,3 +650,6 @@ python manage.py cosign_ledger --sealer-id <ID> --share-file a.txt --share-file 
 - [x] Audit log untuk key rotation events
 - [x] Multi-region sealer setup
 - [x] Shamir's Secret Sharing untuk private key distribution
+- [x] Signature wajib untuk setiap blok
+- [x] Anchoring checkpoint eksternal + fork detection
+- [ ] Backend anchor OpenTimestamps / transparency log

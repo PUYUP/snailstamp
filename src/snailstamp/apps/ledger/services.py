@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import struct
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 from django.apps import apps
@@ -28,10 +29,11 @@ from nacl import signing
 from nacl.encoding import RawEncoder
 from nacl.exceptions import BadSignatureError
 
-from . import shamir
+from . import anchors, shamir
 from .models import (
     Action,
     Block,
+    BlockAnchor,
     BlockSignature,
     Collection,
     Kind,
@@ -437,11 +439,17 @@ def _public_hex(signing_key):
     return signing_key.verify_key.encode(encoder=RawEncoder).hex()
 
 
+def _signatures_required():
+    """settings.LEDGER_REQUIRE_BLOCK_SIGNATURES (default True): blok wajib ditandatangani sealer terdaftar."""
+    return getattr(settings, "LEDGER_REQUIRE_BLOCK_SIGNATURES", True)
+
+
 def _active_sealer_for(sealer_id, public_key):
-    try:
-        sealer = SealerKey.objects.get(id=sealer_id)
-    except SealerKey.DoesNotExist:
-        raise InvalidInput(f"Sealer {sealer_id} tidak ditemukan")
+    """SealerKey aktif untuk key ini. sealer_id=None -> cari berdasarkan public key."""
+    lookup = {"id": sealer_id} if sealer_id else {"public_key": public_key, "status": SealerKey.KeyStatus.ACTIVE}
+    sealer = SealerKey.objects.filter(**lookup).order_by("-valid_from").first()
+    if sealer is None:
+        raise InvalidInput(f"Sealer {sealer_id or public_key} tidak terdaftar")
     if not sealer.is_active:
         raise InvalidInput(f"Sealer {sealer_id} tidak aktif atau sudah expired")
     if sealer.public_key != public_key:
@@ -464,7 +472,24 @@ def seal_next_block(window=timedelta(seconds=10), safety_lag=timedelta(seconds=2
 
     Setiap pemakaian key dicatat sebagai KEY_USED di SealerKeyAuditLog. Sealer di region lain
     bisa menambah signature belakangan lewat cosign_block().
+
+    Bila settings.LEDGER_REQUIRE_BLOCK_SIGNATURES (default True), menolak menyegel tanpa key, dan
+    setiap key harus milik SealerKey aktif yang terdaftar (InvalidInput).
     """
+    if isinstance(sealer_private_keys, (str, bytes)):          # legacy: satu key tanpa sealer_id
+        sealer_private_keys = [{"sealer_id": None, "private_key": sealer_private_keys}]
+    required = _signatures_required()
+    if required and not sealer_private_keys:
+        raise InvalidInput("Blok wajib ditandatangani: berikan sealer_private_keys "
+                           "(LEDGER_REQUIRE_BLOCK_SIGNATURES)")
+    signers = []                                               # (signing_key, public_key, sealer|None)
+    for sealer_info in sealer_private_keys or []:
+        signing_key = _signing_key(sealer_info["private_key"])
+        public_key = _public_hex(signing_key)
+        sealer_id = sealer_info.get("sealer_id")
+        sealer = _active_sealer_for(sealer_id, public_key) if (sealer_id or required) else None
+        signers.append((signing_key, public_key, sealer))
+
     with transaction.atomic(), connection.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_xact_lock(%s)", [BLOCK_LOCK_KEY])
         if not cur.fetchone()[0]:
@@ -498,26 +523,13 @@ def seal_next_block(window=timedelta(seconds=10), safety_lag=timedelta(seconds=2
 
         block_hash = _block_hash(prev, root, start, end, count)
 
-        # Sign block dengan multi-signature
-        signatures, used = [], []
-        if sealer_private_keys is not None:
-            # Handle legacy single key
-            if isinstance(sealer_private_keys, (str, bytes)):
-                sealer_private_keys = [{"sealer_id": None, "private_key": sealer_private_keys}]
-
-            for sealer_info in sealer_private_keys:
-                signing_key = _signing_key(sealer_info["private_key"])
-                sealer_id = sealer_info.get("sealer_id")
-                public_key = _public_hex(signing_key)
-                sealer = _active_sealer_for(sealer_id, public_key) if sealer_id else None
-                signatures.append({
-                    "sealer_id": str(sealer_id) if sealer_id else None,
-                    "public_key": public_key,
-                    "region": _sealer_region(sealer),
-                    "signature": signing_key.sign(block_hash, encoder=RawEncoder).signature.hex(),
-                })
-                if sealer:
-                    used.append(sealer)
+        signatures = [{
+            "sealer_id": str(sealer.id) if sealer else None,
+            "public_key": public_key,
+            "region": _sealer_region(sealer),
+            "signature": signing_key.sign(block_hash, encoder=RawEncoder).signature.hex(),
+        } for signing_key, public_key, sealer in signers]
+        used = [sealer for _, _, sealer in signers if sealer]
 
         cur.execute(
             "INSERT INTO ledger_blocks (block_no, window_start, window_end, log_count, "
@@ -537,7 +549,8 @@ def verify_blocks(first=1, last=None, verify_signature=True, threshold=None, min
     Args:
         first: Block number pertama untuk verifikasi
         last: Block number terakhir (None = sampai terakhir)
-        verify_signature: Jika True, verifikasi signature sealer (embedded + co-signature) jika ada
+        verify_signature: Jika True, verifikasi signature sealer (embedded + co-signature). Blok tanpa
+                          signature hanya lolos bila LEDGER_REQUIRE_BLOCK_SIGNATURES=False.
         threshold: Minimum signature valid yang dibutuhkan (None = settings.BLOCK_SIGNATURE_THRESHOLD / 1)
         min_regions: Minimum region berbeda di antara signature valid
                      (None = settings.LEDGER_SEALER_MIN_REGIONS / 1)
@@ -563,8 +576,7 @@ def verify_blocks(first=1, last=None, verify_signature=True, threshold=None, min
                 or bytes(b.block_hash) != _block_hash(prev, root, b.window_start, b.window_end, count)):
             return False, b.block_no
 
-        # Blok tanpa signature sama sekali (blok lama) tetap lolos demi kompatibilitas.
-        if verify_signature and (b.signatures or b.cosignatures.exists()):
+        if verify_signature and (_signatures_required() or b.signatures or b.cosignatures.exists()):
             ok, _ = verify_block_signatures(b, threshold=threshold, min_regions=min_regions)
             if not ok:
                 return False, b.block_no
@@ -872,6 +884,151 @@ def pending_cosign_blocks(sealer_id, limit=100):
     return (Block.objects.exclude(block_no__in=signed)
             .exclude(signatures__contains=[{"public_key": sealer.public_key}])
             .order_by("block_no")[:limit])
+
+
+# ---------------------------------------------------------------- anchoring & fork detection
+# Checkpoint blok diterbitkan ke luar DB (anchors.py). detect_forks() membandingkan checkpoint
+# eksternal dengan isi DB: rollback (blok hilang), rewrite (hash beda), equivocation (key sealer
+# yang sama menandatangani dua riwayat berbeda), dan chain yang tidak lagi konsisten.
+@dataclass(frozen=True)
+class ForkFinding:
+    kind: str            # missing_block | hash_mismatch | equivocation | invalid_checkpoint |
+                         # anchor_conflict | chain_invalid | backend_error
+    block_no: int | None
+    backend: str
+    detail: str
+    expected_hash: str = ""
+    actual_hash: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def _valid_signatures(block_hash, signatures):
+    """Public key dari signature Ed25519 yang valid atas block_hash (bytes)."""
+    keys = set()
+    for public_key, signature in signatures:
+        try:
+            signing.VerifyKey(bytes.fromhex(public_key), encoder=RawEncoder).verify(
+                block_hash, bytes.fromhex(signature), encoder=RawEncoder)
+            keys.add(public_key)
+        except (BadSignatureError, TypeError, ValueError):
+            continue
+    return keys
+
+
+def checkpoint_for_block(block):
+    """Checkpoint (anchors.Checkpoint) untuk blok: hash, tautan, dan semua signature valid saat ini."""
+    sigs, seen = [], set()
+    for sealer_id, public_key, signature, _ in _block_signature_candidates(block):
+        if public_key and signature and public_key not in seen and _signature_ok(block, public_key, signature):
+            seen.add(public_key)
+            region = next((c.region for c in block.cosignatures.all() if c.public_key == public_key), None)
+            if region is None:
+                region = next((s.get("region", "") for s in block.signatures or []
+                               if s.get("public_key") == public_key), "")
+            sigs.append({"public_key": public_key, "signature": signature, "region": region})
+    return anchors.Checkpoint(block_no=block.block_no, block_hash=bytes(block.block_hash).hex(),
+                              prev_block_hash=bytes(block.prev_block_hash).hex(),
+                              window_end_us=_micros(block.window_end), signatures=sigs)
+
+
+def anchor_blocks(force=False, backends=None):
+    """Terbitkan checkpoint blok terbaru ke tiap backend anchor.
+
+    Per backend: hanya bila sudah >= settings.LEDGER_ANCHOR_INTERVAL (default 100) blok sejak anchor
+    terakhir backend itu (atau force=True). Sebelum menerbitkan, chain sejak anchor terakhir
+    diverifikasi ulang (termasuk signature) -- ledger yang rusak tidak pernah di-anchor.
+
+    Returns:
+        list BlockAnchor yang baru dibuat
+    """
+    backends = anchors.get_backends() if backends is None else backends
+    latest = Block.objects.order_by("-block_no").first()
+    if latest is None or not backends:
+        return []
+    interval = max(1, getattr(settings, "LEDGER_ANCHOR_INTERVAL", 100) or 1)
+    checkpoint, verified_from, created = checkpoint_for_block(latest), None, []
+    for backend in backends:
+        last = BlockAnchor.objects.filter(backend=backend.name).order_by("-block_no").first()
+        last_no = last.block_no if last else 0
+        if latest.block_no <= last_no or (not force and latest.block_no - last_no < interval):
+            continue
+        if last and bytes(Block.objects.get(pk=last.block_no).block_hash).hex() != last.block_hash:
+            raise InvalidState(f"Blok #{last.block_no} berbeda dari anchor {backend.name}; menolak anchor")
+        start = last_no + 1
+        if verified_from is None or start < verified_from:
+            ok, bad = verify_blocks(first=start, last=latest.block_no)
+            if not ok:
+                raise InvalidState(f"Blok #{bad} gagal verifikasi; menolak anchor")
+            verified_from = start
+        receipt = backend.publish(checkpoint)
+        created.append(BlockAnchor.objects.create(block_no=latest.block_no, block_hash=checkpoint.block_hash,
+                                                  backend=backend.name, receipt=receipt))
+    return created
+
+
+def detect_forks(backends=None, verify_chain=True):
+    """Bandingkan checkpoint di backend anchor eksternal dengan blok di DB.
+
+    Args:
+        backends: list AnchorBackend (None = dari settings)
+        verify_chain: juga jalankan verify_blocks() atas seluruh chain
+
+    Returns:
+        list ForkFinding -- kosong berarti DB konsisten dengan semua checkpoint yang diterbitkan
+    """
+    backends = anchors.get_backends() if backends is None else backends
+    findings, seen = [], {}                                     # block_no -> (hash, backend)
+    for backend in backends:
+        try:
+            checkpoints = backend.checkpoints()
+        except anchors.AnchorError as exc:
+            findings.append(ForkFinding("backend_error", None, backend.name, str(exc)))
+            continue
+        for cp in checkpoints:
+            findings += _check_checkpoint(cp, backend.name, seen)
+    if verify_chain:
+        ok, bad = verify_blocks()
+        if not ok:
+            findings.append(ForkFinding("chain_invalid", bad, "", "verify_blocks gagal (Merkle/tautan/signature)"))
+    return findings
+
+
+def _check_checkpoint(cp, backend_name, seen):
+    try:
+        expected = bytes.fromhex(cp.block_hash)
+    except ValueError:
+        return [ForkFinding("invalid_checkpoint", cp.block_no, backend_name, "block_hash bukan hex")]
+    cp_keys = _valid_signatures(expected, [(s.get("public_key"), s.get("signature")) for s in cp.signatures])
+    registered = set(SealerKey.objects.filter(public_key__in=cp_keys).values_list("public_key", flat=True))
+    if _signatures_required() and not registered:
+        return [ForkFinding("invalid_checkpoint", cp.block_no, backend_name,
+                            "checkpoint tanpa signature valid dari sealer terdaftar", cp.block_hash)]
+    findings = []
+    other = seen.setdefault(cp.block_no, (cp.block_hash, backend_name))
+    if other[0] != cp.block_hash:
+        findings.append(ForkFinding("anchor_conflict", cp.block_no, backend_name,
+                                    f"checkpoint berbeda dengan backend {other[1]}", other[0], cp.block_hash))
+    block = Block.objects.filter(pk=cp.block_no).first()
+    if block is None:
+        findings.append(ForkFinding("missing_block", cp.block_no, backend_name,
+                                    "blok yang sudah di-anchor tidak ada di DB (rollback/truncate)", cp.block_hash))
+        return findings
+    actual = bytes(block.block_hash)
+    if actual == expected:
+        return findings
+    db_keys = _valid_signatures(actual, [(pk, sig) for _, pk, sig, _ in _block_signature_candidates(block)])
+    both = sorted(registered & db_keys)
+    if both:
+        findings.append(ForkFinding("equivocation", cp.block_no, backend_name,
+                                    f"key sealer menandatangani dua blok berbeda: {', '.join(both)}",
+                                    cp.block_hash, actual.hex()))
+    else:
+        findings.append(ForkFinding("hash_mismatch", cp.block_no, backend_name,
+                                    "block_hash di DB berbeda dari checkpoint (riwayat ditulis ulang)",
+                                    cp.block_hash, actual.hex()))
+    return findings
 
 
 # ---------------------------------------------------------------- Shamir's Secret Sharing

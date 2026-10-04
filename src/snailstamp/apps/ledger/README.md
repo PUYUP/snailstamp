@@ -31,7 +31,9 @@ association, koleksi bisa dibagi (kakak, adik, kerabat) dan bisa diwariskan tanp
 2. `python manage.py migrate` — `0001_schema` membuat tabel/partisi/trigger/fungsi dari `sql/0001_schema.sql`,
    `0002_seed_registry` mengisi registry contoh, `0003_state` hanya state model Django.
 3. Pengecekan keanggotaan (lihat bawah). Bawaan: `tenant.Member` punya FK `association`.
-4. Jalankan `python manage.py seal_ledger` sebagai satu service (menyegel blok tiap ~10 dtk).
+4. Jalankan `python manage.py seal_ledger --sealer SEALER_ID:ENV_VAR` sebagai satu service (menyegel blok
+   tiap ~10 dtk; blok wajib ditandatangani), `anchor_ledger` untuk anchor checkpoint ke luar DB, dan
+   `check_forks` di monitoring (lihat `BLOCK_SIGNING.md`).
 5. Disarankan: role `ledger_app` yang hanya punya SELECT + EXECUTE; set `idle_in_transaction_session_timeout`.
 
 ### Pengecekan keanggotaan (`LEDGER_MEMBER_CHECK`)

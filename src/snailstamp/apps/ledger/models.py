@@ -418,4 +418,27 @@ class BlockSignature(AppendOnlyModel):
         return f"block #{self.block_id} by {self.sealer_id} ({self.region or '-'})"
 
 
-from .assets import Asset  # noqa: E402,F401  (daftarkan model Asset ke app ledger)
+class BlockAnchor(AppendOnlyModel):
+    """Catatan checkpoint blok yang sudah diterbitkan ke backend anchor eksternal (lihat anchors.py).
+
+    Hanya indeks lokal; verifikasi fork SELALU membaca checkpoint dari backend eksternal, karena
+    tabel ini sendiri bisa ditulis ulang oleh superuser DB.
+    """
+    id = models.BigAutoField(primary_key=True)
+    block_no = models.BigIntegerField()
+    block_hash = models.CharField(max_length=64)
+    backend = models.CharField(max_length=64)
+    receipt = models.TextField(blank=True, default="")
+    anchored_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ledger_block_anchors'
+        ordering = ['-block_no']
+        constraints = [
+            models.UniqueConstraint(fields=['block_no', 'backend'], name='ledger_anchor_unique'),
+        ]
+
+    def __str__(self):
+        return f"anchor block #{self.block_no} -> {self.backend}"
+
+from .assets import Asset  # noqa: F401  (daftarkan model Asset ke app ledger)

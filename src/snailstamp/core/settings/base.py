@@ -203,3 +203,20 @@ SPECTACULAR_SETTINGS = {
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
 }
+
+# Ledger integrity (lihat BLOCK_SIGNING.md)
+LEDGER_REQUIRE_BLOCK_SIGNATURES = env.bool('LEDGER_REQUIRE_BLOCK_SIGNATURES', default=True)
+LEDGER_ANCHOR_INTERVAL = env.int('LEDGER_ANCHOR_INTERVAL', default=100)
+LEDGER_ANCHOR_BACKENDS = []
+if env('LEDGER_ANCHOR_FILE', default=''):
+    LEDGER_ANCHOR_BACKENDS.append({
+        'NAME': 'file',
+        'BACKEND': 'snailstamp.apps.ledger.anchors.FileAnchorBackend',
+        'OPTIONS': {'path': env('LEDGER_ANCHOR_FILE')},
+    })
+if env('LEDGER_ANCHOR_URL', default=''):
+    LEDGER_ANCHOR_BACKENDS.append({
+        'NAME': 'http',
+        'BACKEND': 'snailstamp.apps.ledger.anchors.HttpAnchorBackend',
+        'OPTIONS': {'url': env('LEDGER_ANCHOR_URL'), 'token_env': 'LEDGER_ANCHOR_TOKEN'},
+    })
