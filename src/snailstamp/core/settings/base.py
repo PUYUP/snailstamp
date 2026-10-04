@@ -19,6 +19,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Environment variables
 environ.Env.read_env(os.path.join(BASE_DIR.parent.parent.parent, '.env'))
+env = environ.Env()
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
@@ -35,21 +36,25 @@ ALLOWED_HOSTS = []
 # Application definition
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
 
-    # third party
+    # local apps FIRST (tenant must be before auth)
+    'snailstamp.apps.tenant',
+    'snailstamp.apps.ledger',
+
+    # auth after tenant (custom user model)
+    'django.contrib.auth',
+
+    # third party (depends on auth)
     'guardian',
     'organizations',
     'drf_spectacular',
 
-    # local apps
-    'snailstamp.apps.tenant',
-    'snailstamp.apps.ledger',
+    # admin last
+    'django.contrib.admin',
 ]
 
 MIDDLEWARE = [
@@ -128,6 +133,41 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+
+
+# Storage Configuration
+# https://docs.djangoproject.com/en/6.1/topics/files/
+
+# Default storage backend (local for development, S3 for production)
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
+
+# Media files (user uploads)
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR.parent.parent.parent / 'media'
+
+# S3 Configuration (for production)
+# Set USE_S3=True in .env to enable S3 storage
+USE_S3 = env.bool('USE_S3', default=False)
+
+if USE_S3:
+    STORAGES['default'] = {
+        'BACKEND': 'storages.backends.s3boto3.S3Boto3Storage',
+        'OPTIONS': {
+            'bucket_name': env('AWS_STORAGE_BUCKET_NAME'),
+            'region_name': env('AWS_S3_REGION_NAME', default='us-east-1'),
+            'custom_domain': env('AWS_S3_CUSTOM_DOMAIN', default=None),
+            'file_overwrite': False,  # Content-addressable: don't overwrite
+            'default_acl': 'private',
+        },
+    }
+    MEDIA_URL = f"https://{env('AWS_STORAGE_BUCKET_NAME')}.s3.{env('AWS_S3_REGION_NAME', default='us-east-1')}.amazonaws.com/"
 
 
 # Email

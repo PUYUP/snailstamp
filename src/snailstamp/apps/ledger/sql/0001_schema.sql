@@ -194,11 +194,12 @@ CREATE TABLE ledger_logs (
     created_at      timestamptz NOT NULL,
     seq             integer     NOT NULL,   -- urutan per collection: 1,2,3,...
     target_seq      integer,                -- seq log pasangan di collection target
-    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 (dicadangkan, tidak dipakai), 7 ACTED_ON (sasaran)
+    event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 ASSIGN, 7 ACTED_ON (sasaran)
     action_id       smallint,               -- USE/ACTED_ON: kata kerja dari ledger_actions
     hash            bytea       NOT NULL,   -- sha256, 32 byte
     content_hash    bytea,                  -- ACTED_ON: sha256 isi (tulisan/foto/...). Isi asli di luar ledger
     payload         jsonb,                  -- metadata kecil bebas (maks 4 KB). JANGAN isi data pribadi
+    state_snapshot  jsonb,                  -- JSON snapshot Collection state saat log dibuat (untuk rekonstruksi)
     PRIMARY KEY (collection_id, seq)
 ) PARTITION BY HASH (collection_id);
 
@@ -358,11 +359,48 @@ BEGIN
   END IF;
 END $$;
 
+-- internal: generate JSON snapshot dari Collection state (untuk rekonstruksi)
+CREATE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb
+LANGUAGE sql STABLE AS $$
+SELECT jsonb_build_object(
+  'id', c.id,
+  'entry_id', c.entry_id,
+  'serial_no', c.serial_no,
+  'owner_id', c.owner_id,
+  'holder_id', c.holder_id,
+  'state', c.state,
+  'kind', c.kind,
+  'last_seq', c.last_seq,
+  'tool_uses', c.tool_uses,
+  'target_acts', c.target_acts,
+  'last_hash', encode(c.last_hash, 'hex'),
+  'created_at', c.created_at,
+  'updated_at', c.updated_at,
+  'asset', (
+    SELECT jsonb_build_object(
+      'id', a.id,
+      'storage_path', a.storage_path,
+      'content_hash', a.content_hash,
+      'original_filename', a.original_filename,
+      'file_size', a.file_size,
+      'mime_type', a.mime_type,
+      'status', a.status,
+      'metadata', a.metadata,
+      'uploaded_at', a.uploaded_at,
+      'updated_at', a.updated_at
+    )
+    FROM ledger_assets a
+    WHERE a.collection_id = c.id AND a.status = 'active'
+    LIMIT 1
+  )
+) $$;
+
 -- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.
 CREATE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
                                  p_counterparty uuid, p_payload jsonb, p_ts timestamptz,
                                  p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,
                                  p_action_id smallint DEFAULT NULL, p_content_hash bytea DEFAULT NULL,
+                                 p_state_snapshot jsonb DEFAULT NULL,
                                  OUT new_seq int, OUT new_hash bytea)
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -374,9 +412,9 @@ BEGIN
                               p_counterparty, p_ts, p_payload, p_target_id, p_target_seq,
                               p_action_id, p_content_hash);
   INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, target_id, created_at,
-                           seq, target_seq, event_type, action_id, hash, content_hash, payload)
+                           seq, target_seq, event_type, action_id, hash, content_hash, payload, state_snapshot)
   VALUES (c.id, p_actor, p_actor_member, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,
-          p_event, p_action_id, new_hash, p_content_hash, p_payload);
+          p_event, p_action_id, new_hash, p_content_hash, p_payload, p_state_snapshot);
 END $$;
 
 -- ENTRY: catat alasan + total supply. Item belum ada sampai di-mint.
@@ -431,22 +469,24 @@ BEGIN
   WITH base AS MATERIALIZED (
     SELECT x.id, x.serial_no,
            ledger_genesis_hash(e.content_hash, x.id, x.serial_no) AS genesis
-    FROM (SELECT nextval('ledger_collection_id_seq') AS id, 
+    FROM (SELECT nextval('ledger_collection_id_seq') AS id,
                  p_prefix || ((((s::bigint * 38742041) + (p_entry_id * 1234567)) % 90000000) + 10000000)::text AS serial_no
           FROM generate_series(v_from, v_to) s) x
-  ), new_logs AS (
-    INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,
-                             seq, event_type, hash, payload)
-    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint,
-           ledger_log_hash(b.genesis, b.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL), NULL
-    FROM base b
-    RETURNING collection_id, hash
   ), new_cols AS (
     INSERT INTO ledger_collections (id, entry_id, serial_no, owner_id, holder_id, state, kind,
                                     last_seq, last_hash, created_at, updated_at)
-    SELECT l.collection_id, e.id, b.serial_no, p_issuer, p_issuer_member, 1, e.kind, 1, l.hash, v_now, v_now
-    FROM new_logs l JOIN base b ON b.id = l.collection_id
-    RETURNING id
+    SELECT b.id, e.id, b.serial_no, p_issuer, p_issuer_member, 1, e.kind, 1, b.genesis, v_now, v_now
+    FROM base b
+    RETURNING id, entry_id, serial_no, owner_id, holder_id, state, kind, last_seq, last_hash, created_at, updated_at
+  ), new_logs AS (
+    INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,
+                             seq, event_type, hash, payload, state_snapshot)
+    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint,
+           ledger_log_hash(b.genesis, b.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL), NULL,
+           ledger_collection_snapshot(c)
+    FROM base b
+    CROSS JOIN new_cols c ON c.id = b.id
+    RETURNING collection_id, hash
   )
   INSERT INTO ledger_holdings (owner_id, collection_id, entry_id, acquired_at)
   SELECT p_issuer, id, e.id, v_now FROM new_cols;
@@ -469,7 +509,8 @@ BEGIN
   IF c.state <> 1 THEN RAISE EXCEPTION 'collection sedang dalam pengiriman' USING ERRCODE = 'LG003'; END IF;
 
   -- Log SEND: counterparty = NULL (penerima belum diketahui)
-  SELECT * INTO w FROM ledger_write_log(c, 2::smallint, p_actor, p_actor_member, NULL, p_payload, v_now);
+  SELECT * INTO w FROM ledger_write_log(c, 2::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
+                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
   transfer_token := gen_random_uuid();
 
   UPDATE ledger_collections
@@ -500,7 +541,8 @@ BEGIN
   IF c.state <> 2 THEN RAISE EXCEPTION 'collection tidak dalam pengiriman' USING ERRCODE = 'LG003'; END IF;
 
   -- Log RECEIVE: actor = penerima, counterparty = pengirim (pemilik lama)
-  SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now);
+  SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now,
+                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
 
   UPDATE ledger_collections
      SET owner_id = p_actor, holder_id = p_actor_member, state = 1,
@@ -530,7 +572,8 @@ BEGIN
   IF c.owner_id <> p_actor THEN RAISE EXCEPTION 'hanya pengirim yang boleh membatalkan' USING ERRCODE = 'LG002'; END IF;
 
   -- Log CANCEL_SEND: counterparty = NULL
-  SELECT * INTO w FROM ledger_write_log(c, 5::smallint, p_actor, p_actor_member, NULL, NULL, v_now);
+  SELECT * INTO w FROM ledger_write_log(c, 5::smallint, p_actor, p_actor_member, NULL, NULL, v_now,
+                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
   UPDATE ledger_collections
      SET state = 1, last_seq = w.new_seq, last_hash = w.new_hash, updated_at = v_now
    WHERE id = c.id;
@@ -577,7 +620,8 @@ BEGIN
   );
 
   -- Tulis ke chain sebagai event ASSIGN (6); counterparty = NULL
-  SELECT * INTO w FROM ledger_write_log(c, 6::smallint, p_actor, p_actor_member, NULL, v_payload, v_now);
+  SELECT * INTO w FROM ledger_write_log(c, 6::smallint, p_actor, p_actor_member, NULL, v_payload, v_now,
+                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
 
   -- Update kolom holder_id + last_seq/last_hash
   UPDATE ledger_collections
@@ -612,7 +656,7 @@ BEGIN
   END IF;
 
   SELECT * INTO w FROM ledger_write_log(c, 4::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                        NULL, NULL, p_action, NULL);
+                                        NULL, NULL, p_action, NULL, ledger_collection_snapshot(c));
   UPDATE ledger_collections
      SET last_seq = w.new_seq, last_hash = w.new_hash, tool_uses = tool_uses + 1, updated_at = v_now
    WHERE id = c.id;                       -- HOT update: tidak ada kolom ber-index yang berubah
@@ -689,9 +733,9 @@ BEGIN
 
   -- seq kedua sisi sudah pasti (baris terkunci) -> bisa saling di-hash
   SELECT * INTO wt FROM ledger_write_log(tool, 4::smallint, p_actor, p_actor_member, NULL, NULL, v_now,
-                                         tgt.id, tgt.last_seq + 1, p_action, NULL);
+                                         tgt.id, tgt.last_seq + 1, p_action, NULL, ledger_collection_snapshot(tool));
   SELECT * INTO wg FROM ledger_write_log(tgt, 7::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                         tool.id, tool.last_seq + 1, p_action, p_content_hash);
+                                         tool.id, tool.last_seq + 1, p_action, p_content_hash, ledger_collection_snapshot(tgt));
   UPDATE ledger_collections
      SET last_seq = wt.new_seq, last_hash = wt.new_hash, tool_uses = tool_uses + 1, updated_at = v_now
    WHERE id = tool.id;
@@ -799,7 +843,7 @@ END $$;
 --       CREATE ROLE ledger_app LOGIN PASSWORD '...';   -- sebelum migrasi
 -- ---------------------------------------------------------------------
 REVOKE EXECUTE ON FUNCTION ledger_write_log(ledger_collections, smallint, uuid, uuid, uuid, jsonb,
-                                            timestamptz, bigint, int, smallint, bytea) FROM PUBLIC;
+                                            timestamptz, bigint, int, smallint, bytea, jsonb) FROM PUBLIC;
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') THEN

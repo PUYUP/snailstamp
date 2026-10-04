@@ -3,6 +3,12 @@ import re
 with open("src/snailstamp/apps/ledger/sql/0001_schema.sql", "r") as f:
     sql = f.read()
 
+# 0. Add state_snapshot column to ledger_logs (before other patches)
+sql = sql.replace(
+    'payload         jsonb,                  -- metadata kecil bebas (maks 4 KB). JANGAN isi data pribadi\n    PRIMARY KEY (collection_id, seq)',
+    'payload         jsonb,                  -- metadata kecil bebas (maks 4 KB). JANGAN isi data pribadi\n    state_snapshot  jsonb,                  -- JSON snapshot Collection state saat log dibuat (untuk rekonstruksi)\n    PRIMARY KEY (collection_id, seq)'
+)
+
 # 1. Update id types from bigint to uuid
 sql = re.sub(r'association_id\s+bigint', 'association_id uuid', sql)
 sql = re.sub(r'issuer_id\s+bigint', 'issuer_id uuid', sql)
@@ -82,18 +88,20 @@ sql = sql.replace(
     'NEW.id, NEW.issuer_id, NEW.issuer_member_id, NEW.reason'
 )
 
-# 6. Update ledger_write_log
+# 5.5. Add ledger_collection_snapshot function (after triggers, before ledger_write_log)
 sql = sql.replace(
-    'c ledger_collections, p_event smallint, p_actor uuid,',
-    'c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,'
+    'END $$;\n\n-- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.',
+    'END $$;\n\n-- internal: generate JSON snapshot dari Collection state (untuk rekonstruksi)\nCREATE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb\nLANGUAGE sql STABLE AS $$\nSELECT jsonb_build_object(\n  \'id\', c.id,\n  \'entry_id\', c.entry_id,\n  \'serial_no\', c.serial_no,\n  \'owner_id\', c.owner_id,\n  \'holder_id\', c.holder_id,\n  \'state\', c.state,\n  \'kind\', c.kind,\n  \'last_seq\', c.last_seq,\n  \'tool_uses\', c.tool_uses,\n  \'target_acts\', c.target_acts,\n  \'last_hash\', encode(c.last_hash, \'hex\'),\n  \'created_at\', c.created_at,\n  \'updated_at\', c.updated_at\n) $$;\n\n-- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.'
+)
+
+# 6. Update ledger_write_log signature
+sql = sql.replace(
+    'c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,\n                                 p_counterparty uuid, p_payload jsonb, p_ts timestamptz,\n                                 p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,\n                                 p_action_id smallint DEFAULT NULL, p_content_hash bytea DEFAULT NULL,\n                                 OUT new_seq int, OUT new_hash bytea)',
+    'c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,\n                                 p_counterparty uuid, p_payload jsonb, p_ts timestamptz,\n                                 p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,\n                                 p_action_id smallint DEFAULT NULL, p_content_hash bytea DEFAULT NULL,\n                                 p_state_snapshot jsonb DEFAULT NULL,\n                                 OUT new_seq int, OUT new_hash bytea)'
 )
 sql = sql.replace(
-    'p_actor,\n                              p_counterparty, p_ts',
-    'p_actor, p_actor_member,\n                              p_counterparty, p_ts'
-)
-sql = sql.replace(
-    'INSERT INTO ledger_logs (collection_id, actor_id, counterparty_id, target_id, created_at,\n                           seq, target_seq, event_type, action_id, hash, content_hash, payload)\n  VALUES (c.id, p_actor, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,\n          p_event, p_action_id, new_hash, p_content_hash, p_payload);',
-    'INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, target_id, created_at,\n                           seq, target_seq, event_type, action_id, hash, content_hash, payload)\n  VALUES (c.id, p_actor, p_actor_member, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,\n          p_event, p_action_id, new_hash, p_content_hash, p_payload);'
+    'INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, target_id, created_at,\n                           seq, target_seq, event_type, action_id, hash, content_hash, payload, state_snapshot)\n  VALUES (c.id, p_actor, p_actor_member, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,\n          p_event, p_action_id, new_hash, p_content_hash, p_payload, p_state_snapshot);',
+    'INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, target_id, created_at,\n                           seq, target_seq, event_type, action_id, hash, content_hash, payload, state_snapshot)\n  VALUES (c.id, p_actor, p_actor_member, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,\n          p_event, p_action_id, new_hash, p_content_hash, p_payload, p_state_snapshot);'
 )
 
 # 7. Update ledger_create_entry
@@ -226,6 +234,36 @@ sql = sql.replace(
 sql = sql.replace(
     "SELECT l.collection_id, l.seq, l.event_type, l.actor_id, l.counterparty_id, ",
     "SELECT l.collection_id, l.seq, l.event_type, l.actor_id, l.actor_member_id, l.counterparty_id, "
+)
+
+# 17. Add state_snapshot to all ledger_write_log calls
+sql = sql.replace(
+    'SELECT * INTO w FROM ledger_write_log(c, 2::smallint, p_actor, p_actor_member, NULL, p_payload, v_now);',
+    'SELECT * INTO w FROM ledger_write_log(c, 2::smallint, p_actor, p_actor_member, NULL, p_payload, v_now, NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));'
+)
+sql = sql.replace(
+    'SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now);',
+    'SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now, NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));'
+)
+sql = sql.replace(
+    'SELECT * INTO w FROM ledger_write_log(c, 5::smallint, p_actor, p_actor_member, NULL, NULL, v_now);',
+    'SELECT * INTO w FROM ledger_write_log(c, 5::smallint, p_actor, p_actor_member, NULL, NULL, v_now, NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));'
+)
+sql = sql.replace(
+    'SELECT * INTO w FROM ledger_write_log(c, 4::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,\n                                        NULL, NULL, p_action, NULL);',
+    'SELECT * INTO w FROM ledger_write_log(c, 4::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,\n                                        NULL, NULL, p_action, NULL, ledger_collection_snapshot(c));'
+)
+sql = sql.replace(
+    'SELECT * INTO wt FROM ledger_write_log(tool, 4::smallint, p_actor, p_actor_member, NULL, NULL, v_now,\n                                         tgt.id, tgt.last_seq + 1, p_action, NULL);',
+    'SELECT * INTO wt FROM ledger_write_log(tool, 4::smallint, p_actor, p_actor_member, NULL, NULL, v_now,\n                                         tgt.id, tgt.last_seq + 1, p_action, NULL, ledger_collection_snapshot(tool));'
+)
+sql = sql.replace(
+    'SELECT * INTO wg FROM ledger_write_log(tgt, 7::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,\n                                         tool.id, tool.last_seq + 1, p_action, p_content_hash);',
+    'SELECT * INTO wg FROM ledger_write_log(tgt, 7::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,\n                                         tool.id, tool.last_seq + 1, p_action, p_content_hash, ledger_collection_snapshot(tgt));'
+)
+sql = sql.replace(
+    'INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,\n                             seq, event_type, hash, payload)\n    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint,\n           ledger_log_hash(b.genesis, b.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL), NULL',
+    'INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,\n                             seq, event_type, hash, payload, state_snapshot)\n    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint,\n           ledger_log_hash(b.genesis, b.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL), NULL, ledger_collection_snapshot(c)'
 )
 
 with open("src/snailstamp/apps/ledger/sql/0001_schema.sql", "w") as f:

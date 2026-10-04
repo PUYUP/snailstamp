@@ -160,7 +160,11 @@ class Collection(LedgerModel):
 
 
 class Log(LedgerModel):
-    """Riwayat append-only. PK = (collection_id, seq). Tabel terbesar."""
+    """Riwayat append-only. PK = (collection_id, seq). Tabel terbesar.
+
+    Setiap log menyimpan state_snapshot = JSON snapshot Collection saat itu,
+    memungkinkan rekonstruksi penuh state Collection dari history log.
+    """
 
     class Event(models.IntegerChoices):
         MINT        = 1, "lahir"
@@ -187,6 +191,7 @@ class Log(LedgerModel):
     hash = models.BinaryField()
     content_hash = models.BinaryField(null=True)       # ACTED_ON: sha256 isi (isi asli di luar ledger)
     payload = models.JSONField(null=True)
+    state_snapshot = models.JSONField(null=True)        # Snapshot Collection state saat log dibuat
 
     class Meta(LedgerModel.Meta):
         db_table = "ledger_logs"

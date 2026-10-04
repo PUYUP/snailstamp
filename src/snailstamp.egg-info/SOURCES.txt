@@ -11,6 +11,7 @@ src/snailstamp.egg-info/top_level.txt
 src/snailstamp/apps/ledger/__init__.py
 src/snailstamp/apps/ledger/admin.py
 src/snailstamp/apps/ledger/apps.py
+src/snailstamp/apps/ledger/assets.py
 src/snailstamp/apps/ledger/models.py
 src/snailstamp/apps/ledger/services.py
 src/snailstamp/apps/ledger/tests.py
@@ -20,6 +21,7 @@ src/snailstamp/apps/ledger/management/commands/seal_ledger.py
 src/snailstamp/apps/ledger/migrations/0001_schema.py
 src/snailstamp/apps/ledger/migrations/0002_seed_registry.py
 src/snailstamp/apps/ledger/migrations/0003_state.py
+src/snailstamp/apps/ledger/migrations/0004_asset.py
 src/snailstamp/apps/ledger/migrations/__init__.py
 src/snailstamp/apps/tenant/__init__.py
 src/snailstamp/apps/tenant/admin.py
