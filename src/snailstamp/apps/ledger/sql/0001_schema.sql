@@ -361,9 +361,11 @@ BEGIN
 END $$;
 
 -- internal: generate JSON snapshot dari Collection state (untuk rekonstruksi)
+-- plpgsql (bukan sql) supaya ledger_assets (dibuat di migrasi 0004) tidak divalidasi saat CREATE.
 CREATE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb
-LANGUAGE sql STABLE AS $$
-SELECT jsonb_build_object(
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+RETURN jsonb_build_object(
   'id', c.id,
   'entry_id', c.entry_id,
   'serial_no', c.serial_no,
@@ -394,7 +396,8 @@ SELECT jsonb_build_object(
     WHERE a.collection_id = c.id AND a.status = 'active'
     LIMIT 1
   )
-) $$;
+);
+END $$;
 
 -- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.
 CREATE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
@@ -468,25 +471,26 @@ BEGIN
   IF v_from > v_to THEN RETURN 0; END IF;     -- supply sudah penuh
 
   WITH base AS MATERIALIZED (
-    SELECT x.id, x.serial_no,
-           ledger_genesis_hash(e.content_hash, x.id, x.serial_no) AS genesis
-    FROM (SELECT nextval('ledger_collection_id_seq') AS id,
-                 p_prefix || ((((s::bigint * 38742041) + (p_entry_id * 1234567)) % 90000000) + 10000000)::text AS serial_no
-          FROM generate_series(v_from, v_to) s) x
+    SELECT g.id, g.serial_no,
+           ledger_log_hash(g.genesis, g.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL) AS h1
+    FROM (SELECT x.id, x.serial_no, ledger_genesis_hash(e.content_hash, x.id, x.serial_no) AS genesis
+          FROM (SELECT nextval('ledger_collection_id_seq') AS id,
+                       p_prefix || ((((s::bigint * 38742041) + (p_entry_id * 1234567)) % 90000000) + 10000000)::text AS serial_no
+                FROM generate_series(v_from, v_to) s) x) g
   ), new_cols AS (
+    -- last_hash = hash log #1 (bukan genesis) supaya log berikutnya tersambung ke log #1
     INSERT INTO ledger_collections (id, entry_id, serial_no, owner_id, holder_id, state, kind,
                                     last_seq, last_hash, created_at, updated_at)
-    SELECT b.id, e.id, b.serial_no, p_issuer, p_issuer_member, 1, e.kind, 1, b.genesis, v_now, v_now
+    SELECT b.id, e.id, b.serial_no, p_issuer, p_issuer_member, 1, e.kind, 1, b.h1, v_now, v_now
     FROM base b
-    RETURNING id, entry_id, serial_no, owner_id, holder_id, state, kind, last_seq, last_hash, created_at, updated_at
+    RETURNING *
   ), new_logs AS (
     INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,
                              seq, event_type, hash, payload, state_snapshot)
-    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint,
-           ledger_log_hash(b.genesis, b.id, 1, 1::smallint, p_issuer, p_issuer_member, NULL, v_now, NULL), NULL,
-           ledger_collection_snapshot(c)
+    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint, b.h1, NULL,
+           ledger_collection_snapshot(ROW(c.*)::ledger_collections)
     FROM base b
-    CROSS JOIN new_cols c ON c.id = b.id
+    JOIN new_cols c ON c.id = b.id
     RETURNING collection_id, hash
   )
   INSERT INTO ledger_holdings (owner_id, collection_id, entry_id, acquired_at)
@@ -798,6 +802,9 @@ BEGIN
     ELSIF r.event_type = 5 THEN
       IF v_state <> 2 OR v_owner <> r.actor_id THEN v_err := 'CANCEL tidak valid'; END IF;
       v_state := 1;
+    ELSIF r.event_type = 6 THEN
+      -- ASSIGN: ganti pemegang (member) dalam association pemilik; owner & state tetap
+      IF v_state <> 1 OR v_owner <> r.actor_id THEN v_err := 'ASSIGN tidak valid'; END IF;
     ELSIF r.event_type = 7 THEN
       -- pelaku boleh bukan pemilik (rule target_access 2/3), jadi owner TIDAK dicek di sini;
       -- pasangannya (log USE di chain alat) yang mewajibkan pelaku = pemilik alat.

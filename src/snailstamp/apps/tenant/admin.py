@@ -1,4 +1,4 @@
-import organizations
+import organizations.admin  # pastikan sudah terdaftar sebelum di-unregister
 from django.contrib import admin
 from snailstamp.apps.tenant.models import (
     User,

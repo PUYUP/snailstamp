@@ -281,8 +281,8 @@ class SealerKey(models.Model):
         db_table = 'ledger_sealer_keys'
         ordering = ['-valid_from']
         indexes = [
-            models.Index(fields=['status']),
-            models.Index(fields=['valid_until']),
+            models.Index(fields=['status'], name='ledger_seale_status_idx'),
+            models.Index(fields=['valid_until'], name='ledger_seale_valid_idx'),
         ]
 
     def __str__(self):
@@ -416,3 +416,6 @@ class BlockSignature(AppendOnlyModel):
 
     def __str__(self):
         return f"block #{self.block_id} by {self.sealer_id} ({self.region or '-'})"
+
+
+from .assets import Asset  # noqa: E402,F401  (daftarkan model Asset ke app ledger)

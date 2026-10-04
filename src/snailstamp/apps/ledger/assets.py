@@ -64,8 +64,8 @@ class Asset(models.Model):
         db_table = 'ledger_assets'
         ordering = ['-uploaded_at']
         indexes = [
-            models.Index(fields=['content_hash']),
-            models.Index(fields=['status']),
+            models.Index(fields=['content_hash'], name='ledger_asse_conten_2b2c3e_idx'),
+            models.Index(fields=['status'], name='ledger_asse_status_3c2c3e_idx'),
         ]
 
     def __str__(self):

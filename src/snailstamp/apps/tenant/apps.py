@@ -3,7 +3,7 @@ from django.apps import AppConfig
 
 class TenantConfig(AppConfig):
     name = 'snailstamp.apps.tenant'
-    label = 'Tenant'
+    label = 'tenant'
 
     def ready(self) -> None:
         pass
