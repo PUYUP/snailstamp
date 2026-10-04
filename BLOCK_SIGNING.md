@@ -640,6 +640,22 @@ python manage.py anchor_ledger --once --force
 python manage.py check_forks                # exit code != 0 bila ada temuan -> pasang di cron/monitoring
 ```
 
+## Append-only di Level Database
+
+Migration `0011_append_only_triggers` menambah trigger PostgreSQL (ERRCODE `LG005`), sama seperti
+`ledger_logs`, sehingga SQL mentah pun ditolak -- bukan hanya ORM:
+
+| Tabel | Ditolak |
+|---|---|
+| `ledger_sealer_audit_logs`, `ledger_block_signatures`, `ledger_block_anchors` | `UPDATE`, `DELETE`, `TRUNCATE` |
+| `ledger_blocks` | `UPDATE`, `DELETE` (sudah ada), `TRUNCATE` (baru) |
+| `ledger_sealer_keys` | `DELETE`, `TRUNCATE`; mengubah `id` / `public_key` / `valid_from` / `region` / `previous_key`; mengaktifkan lagi key yang sudah `revoked` |
+
+`status`, `valid_until`, `deactivated_at`, `metadata` di `ledger_sealer_keys` tetap boleh diubah
+(rotate / expire / revoke). Superuser yang mematikan trigger (`session_replication_role = replica`)
+masih bisa menulis ulang; itu yang ditangkap signature wajib + anchor eksternal (`check_forks`).
+Karena itu jalankan aplikasi dengan role biasa (bukan superuser / pemilik tabel).
+
 ## Performance Impact
 
 - **Signing**: ~0.1ms per signature (Ed25519 sangat cepat)
@@ -676,4 +692,5 @@ python manage.py check_forks                # exit code != 0 bila ada temuan -> 
 - [x] Signature wajib untuk setiap blok
 - [x] Anchoring checkpoint eksternal + fork detection
 - [x] Signature sealer di light-client proof (verify_proof dengan trusted_keys)
+- [x] Trigger append-only DB untuk audit log, co-signature, anchor, dan sealer key
 - [ ] Backend anchor OpenTimestamps / transparency log

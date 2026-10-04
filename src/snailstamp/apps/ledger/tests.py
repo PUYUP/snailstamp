@@ -802,3 +802,66 @@ class LightClientSignatureTests(SealerKeyTestCase):
         out = StringIO()
         call_command("export_sealer_keys", stdout=out)
         self.assertEqual(json.loads(out.getvalue()), svc.trusted_sealer_keys())
+
+
+class DatabaseAppendOnlyTests(SealerKeyTestCase):
+    """Trigger DB: SQL mentah tidak bisa mengubah / menghapus jejak audit, co-signature, anchor."""
+
+    def setUp(self):
+        super().setUp()
+        self.jkt, jkt_key = self._sealer("sealer-jkt", region="ap-southeast-3")
+        self.sgp, sgp_key = self._sealer("sealer-sgp", region="ap-southeast-1")
+        self.block = self._seal([{"sealer_id": self.jkt.id, "private_key": jkt_key}])
+        for b in svc.pending_cosign_blocks(self.sgp.id):
+            svc.cosign_block(b.block_no, self.sgp.id, sgp_key)
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        svc.anchor_blocks(force=True, backends=[anchors.FileAnchorBackend("file", path=f"{tmp.name}/a.jsonl")])
+
+    def _refused(self, sql, params=()):
+        with self.assertRaises(DatabaseError) as cm, transaction.atomic(), connection.cursor() as cur:
+            cur.execute(sql, params)
+        self.assertIn("dilarang", str(cm.exception))
+
+    def _truncate_refused(self, table):
+        """Di dalam transaksi TestCase, FK tertunda bisa menolak TRUNCATE lebih dulu; jadi cek juga
+        bahwa trigger TRUNCATE-nya memang terpasang."""
+        with self.assertRaises(DatabaseError), transaction.atomic(), connection.cursor() as cur:
+            cur.execute(f"TRUNCATE {table} CASCADE")
+        with connection.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_trigger WHERE tgrelid = %s::regclass AND tgname = %s AND tgenabled = 'O'",
+                        [table, f"{table}_no_truncate"])
+            self.assertIsNotNone(cur.fetchone(), f"{table}_no_truncate tidak terpasang")
+
+    def _allowed(self, sql, params=()):
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(sql, params)
+            self.assertGreater(cur.rowcount, 0)
+            transaction.set_rollback(True)
+
+    def test_audit_signature_and_anchor_tables_are_append_only(self):
+        for table, column in [("ledger_sealer_audit_logs", "rotation_reason"),
+                              ("ledger_block_signatures", "signature"),
+                              ("ledger_block_anchors", "block_hash")]:
+            with self.subTest(table=table):
+                self.assertTrue(BlockSignature.objects.exists() and BlockAnchor.objects.exists())
+                self._refused(f"UPDATE {table} SET {column} = 'x'")
+                self._refused(f"DELETE FROM {table}")
+                self._truncate_refused(table)
+        self._truncate_refused("ledger_blocks")
+
+    def test_sealer_key_identity_is_frozen_and_rows_cannot_be_deleted(self):
+        pk = [self.jkt.pk]
+        self._refused("UPDATE ledger_sealer_keys SET public_key = %s WHERE id = %s", ["00" * 32, *pk])
+        self._refused("UPDATE ledger_sealer_keys SET region = 'eu-west-1' WHERE id = %s", pk)
+        self._refused("UPDATE ledger_sealer_keys SET valid_from = now() WHERE id = %s", pk)
+        self._refused("DELETE FROM ledger_sealer_keys WHERE id = %s", pk)
+        self._truncate_refused("ledger_sealer_keys")
+        self._allowed("UPDATE ledger_sealer_keys SET valid_until = now(), metadata = '{}' WHERE id = %s", pk)
+
+    def test_revoked_key_cannot_be_reactivated(self):
+        svc.revoke_sealer_key(self.jkt.id)
+        self._refused("UPDATE ledger_sealer_keys SET status = 'active' WHERE id = %s", [self.jkt.pk])
+        self._allowed("UPDATE ledger_sealer_keys SET metadata = '{}' WHERE id = %s", [self.jkt.pk])
+        with self.assertRaises(DatabaseError), transaction.atomic():
+            SealerKey.objects.filter(pk=self.jkt.pk).update(status=SealerKey.KeyStatus.ACTIVE)
