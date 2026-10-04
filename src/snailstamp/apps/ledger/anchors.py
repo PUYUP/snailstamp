@@ -138,10 +138,13 @@ class HttpAnchorBackend(AnchorBackend):
         return [Checkpoint.from_dict(item) for item in data]
 
 
-def get_backends():
-    """Instans backend dari settings.LEDGER_ANCHOR_BACKENDS (list kosong = anchoring nonaktif)."""
+def get_backends(setting="LEDGER_ANCHOR_BACKENDS"):
+    """Instans backend dari settings.<setting> (list kosong = nonaktif).
+
+    LEDGER_ANCHOR_BACKENDS = anchor utama; LEDGER_WITNESS_BACKENDS = salinan milik watchtower region.
+    """
     backends = []
-    for i, conf in enumerate(getattr(settings, "LEDGER_ANCHOR_BACKENDS", None) or []):
+    for i, conf in enumerate(getattr(settings, setting, None) or []):
         cls = import_string(conf["BACKEND"])
         backends.append(cls(conf.get("NAME") or f"anchor{i}", **(conf.get("OPTIONS") or {})))
     return backends

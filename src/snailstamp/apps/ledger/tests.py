@@ -619,7 +619,8 @@ class AnchorAndForkDetectionTests(SealerKeyTestCase):
     def test_broken_chain_is_never_anchored(self):
         self._seal(self.keys)
         SealerKey.objects.filter(pk=self.sealer.pk).update(status=SealerKey.KeyStatus.REVOKED)
-        with self.assertRaises(svc.InvalidState):
+        self.assertEqual(svc.anchor_blocks(), [])                  # mungkin masih menunggu co-sign
+        with override_settings(LEDGER_MAX_COSIGN_LAG=0), self.assertRaises(svc.InvalidState):
             svc.anchor_blocks()
         self.assertFalse(self.path.exists())
 
@@ -865,3 +866,132 @@ class DatabaseAppendOnlyTests(SealerKeyTestCase):
         self._allowed("UPDATE ledger_sealer_keys SET metadata = '{}' WHERE id = %s", [self.jkt.pk])
         with self.assertRaises(DatabaseError), transaction.atomic():
             SealerKey.objects.filter(pk=self.jkt.pk).update(status=SealerKey.KeyStatus.ACTIVE)
+
+
+class _Capture:
+    """HTTP server lokal yang mencatat body JSON tiap POST (untuk webhook alert)."""
+
+    def __enter__(self):
+        received = self.received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/"
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@override_settings(BLOCK_SIGNATURE_THRESHOLD=2, LEDGER_SEALER_MIN_REGIONS=2)
+class MultiSealerProductionTests(SealerKeyTestCase):
+    """2 signature dari 2 region: anchoring, watchtower, dan failover sealer."""
+
+    def setUp(self):
+        super().setUp()
+        self.jkt, jkt_key = self._sealer("sealer-jkt", region="ap-southeast-3")
+        self.sgp, self.sgp_key = self._sealer("sealer-sgp", region="ap-southeast-1")
+        self.jkt_keys = [{"sealer_id": self.jkt.id, "private_key": jkt_key}]
+        self.sgp_keys = [{"sealer_id": self.sgp.id, "private_key": self.sgp_key}]
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def _backend(self, name="file"):
+        return anchors.FileAnchorBackend(name, path=str(self.dir / f"{name}.jsonl"))
+
+    def _cosign_all(self):
+        for b in svc.pending_cosign_blocks(self.sgp.id):
+            svc.cosign_block(b.block_no, self.sgp.id, self.sgp_key)
+
+    def test_anchor_waits_for_cosign_and_picks_latest_fully_signed_block(self):
+        first = self._seal(self.jkt_keys)
+        backend = self._backend()
+        self.assertEqual(svc.anchor_blocks(force=True, backends=[backend]), [])   # baru 1 region
+        self._cosign_all()
+        second = self._seal(self.jkt_keys)                         # belum di-co-sign
+        self.assertEqual(svc.latest_fully_signed_block().block_no, first.block_no)
+        (anchor,) = svc.anchor_blocks(force=True, backends=[backend])
+        self.assertEqual(anchor.block_no, first.block_no)
+        (cp,) = backend.checkpoints()
+        self.assertEqual({s["region"] for s in cp.signatures}, {"ap-southeast-1", "ap-southeast-3"})
+        self._cosign_all()
+        (anchor,) = svc.anchor_blocks(force=True, backends=[backend])
+        self.assertEqual(anchor.block_no, second.block_no)
+        self.assertEqual(svc.detect_forks(backends=[backend]), [])
+
+    def test_health_reports_stale_chain_and_cosign_lag(self):
+        self._seal(self.jkt_keys)
+        self.assertEqual(svc.ledger_health(max_block_age=timedelta(hours=1)), [])
+        kinds = {f.kind for f in svc.ledger_health(max_block_age=timedelta(0), max_cosign_lag=timedelta(0))}
+        self.assertEqual(kinds, {"stale_chain", "cosign_lag"})
+        self._cosign_all()
+        self.assertEqual(svc.ledger_health(max_block_age=timedelta(hours=1), max_cosign_lag=timedelta(0)), [])
+
+    def test_watch_ledger_keeps_own_checkpoints_and_alerts(self):
+        self._seal(self.jkt_keys)
+        self._cosign_all()
+        witness = [{"NAME": "witness-sgp", "BACKEND": "snailstamp.apps.ledger.anchors.FileAnchorBackend",
+                    "OPTIONS": {"path": str(self.dir / "witness.jsonl")}}]
+        with override_settings(LEDGER_WITNESS_BACKENDS=witness, LEDGER_MAX_BLOCK_AGE=3600):
+            out = StringIO()
+            call_command("watch_ledger", "--once", stdout=out, stderr=StringIO())
+            self.assertIn('"witness": "witness-sgp"', out.getvalue())
+            self.assertTrue(BlockAnchor.objects.filter(backend="witness-sgp").exists())
+            with override_settings(LEDGER_MAX_BLOCK_AGE=0), _Capture() as hook, self.assertRaises(CommandError):
+                call_command("watch_ledger", "--once", "--webhook", hook.url, stdout=StringIO(), stderr=StringIO())
+        (alert,) = hook.received
+        self.assertEqual([f["kind"] for f in alert["findings"]], ["stale_chain"])
+
+    def test_standby_sealer_takes_over(self):
+        """Dua seal_ledger (JKT aktif, SGP standby) di DB yang sama: advisory lock memastikan hanya
+        satu yang menyegel dan standby tidak ikut menunggu; setelah itu SGP melanjutkan chain yang sama."""
+        self._seal(self.jkt_keys)               # transaksi tes ini memegang lock sealer (seperti JKT aktif)
+        standby = connection.get_new_connection(connection.get_connection_params())
+        try:
+            standby.autocommit = True
+            with standby.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_xact_lock(%s)", [svc.BLOCK_LOCK_KEY])
+                self.assertFalse(cur.fetchone()[0])                # standby langsung mundur, tidak blocking
+        finally:
+            standby.close()
+        svc.create_entry(self.assoc, self.member, "setelah failover", 1)
+        time.sleep(2.2)
+        sealed = []
+        while block := svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0),
+                                           sealer_private_keys=self.sgp_keys):
+            sealed.append(block)
+        self.assertTrue(sealed)
+        self.assertEqual({s["region"] for b in svc.Block.objects.all() for s in b.signatures},
+                         {"ap-southeast-1", "ap-southeast-3"})
+        self.assertEqual(svc.verify_blocks(threshold=1, min_regions=1), (True, None))
+        self.assertEqual(svc.verify_blocks(), (False, 1))          # 2/2 belum terpenuhi
+        jkt_private = self.jkt_keys[0]["private_key"]
+        for b in svc.pending_cosign_blocks(self.jkt.id):
+            svc.cosign_block(b.block_no, self.jkt.id, jkt_private)
+        self._cosign_all()
+        self.assertEqual(svc.verify_blocks(), (True, None))
+
+
+class DeployChecksTests(SimpleTestCase):
+    def test_deploy_checks(self):
+        from .checks import ledger_deploy_checks
+        anchor = [{"NAME": "f", "BACKEND": "snailstamp.apps.ledger.anchors.FileAnchorBackend",
+                   "OPTIONS": {"path": "/tmp/x"}}]
+        with override_settings(BLOCK_SIGNATURE_THRESHOLD=1, LEDGER_SEALER_MIN_REGIONS=1,
+                               LEDGER_ANCHOR_BACKENDS=[], LEDGER_REQUIRE_BLOCK_SIGNATURES=False):
+            self.assertEqual({i.id for i in ledger_deploy_checks(None)}, {"ledger.E001", "ledger.W001", "ledger.W002"})
+        with override_settings(BLOCK_SIGNATURE_THRESHOLD=2, LEDGER_SEALER_MIN_REGIONS=2,
+                               LEDGER_ANCHOR_BACKENDS=anchor, LEDGER_REQUIRE_BLOCK_SIGNATURES=True):
+            self.assertEqual(ledger_deploy_checks(None), [])
+

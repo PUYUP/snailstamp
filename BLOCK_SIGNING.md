@@ -656,6 +656,61 @@ Migration `0011_append_only_triggers` menambah trigger PostgreSQL (ERRCODE `LG00
 masih bisa menulis ulang; itu yang ditangkap signature wajib + anchor eksternal (`check_forks`).
 Karena itu jalankan aplikasi dengan role biasa (bukan superuser / pemilik tabel).
 
+## Produksi: 2-of-2 Region, Watchtower, Failover
+
+### 1. Wajib 2 signature dari 2 region
+
+```bash
+BLOCK_SIGNATURE_THRESHOLD=2
+LEDGER_SEALER_MIN_REGIONS=2
+```
+
+`python manage.py check --deploy` memberi peringatan (`ledger.W001`) bila masih 1 signature / 1 region,
+`ledger.W002` bila anchor belum dikonfigurasi, dan error `ledger.E001` bila signature tidak wajib.
+
+Blok terbaru biasanya baru ditandatangani region penyegel; region lain menambah signature lewat
+`cosign_ledger`. Karena itu `anchor_blocks()` meng-anchor **blok terakhir yang signature-nya sudah
+lengkap** (`latest_fully_signed_block()`), bukan blok terbaru. Bila satu blok tertahan lebih dari
+`LEDGER_MAX_COSIGN_LAG` detik (default 300), anchoring berhenti dengan `InvalidState`.
+
+### 2. Watchtower per region
+
+Tiap region menjalankan pengawas sendiri dengan salinan checkpoint di storage miliknya:
+
+```bash
+LEDGER_SEALER_REGION=ap-southeast-1
+LEDGER_WITNESS_FILE=/mnt/sgp-worm/snailstamp-witness.jsonl   # backend "witness-ap-southeast-1"
+LEDGER_ALERT_WEBHOOK=https://hooks.example.com/ledger         # POST JSON {"host", "findings": [...]}
+LEDGER_MAX_BLOCK_AGE=60
+LEDGER_MAX_COSIGN_LAG=300
+
+python manage.py watch_ledger                 # service: tiap 60 dtk
+python manage.py watch_ledger --once          # cron: exit code != 0 bila ada temuan
+```
+
+Tiap putaran:
+1. mencatat checkpoint blok terakhir yang sudah lengkap ke `LEDGER_WITNESS_BACKENDS` (setelah
+   memverifikasi ulang chain) -- operator satu region tidak bisa mengubah salinan region lain;
+2. `detect_forks()` terhadap salinan itu (`verify_blocks()` penuh tiap `--verify-every` putaran);
+3. `ledger_health()`: `stale_chain` (tidak ada blok baru > `LEDGER_MAX_BLOCK_AGE`, semua sealer mati)
+   dan `cosign_lag` (co-signer region lain mati / tertinggal);
+4. kirim alert ke webhook bila ada temuan (`witness_refused` bila witness menolak mencatat).
+
+### 5. Failover sealer
+
+Jalankan `seal_ledger` di **dua region sekaligus**, masing-masing dengan key region itu:
+
+```bash
+# JKT                                                    # SGP
+python manage.py seal_ledger --sealer <JKT_ID>:KEY_JKT   python manage.py seal_ledger --sealer <SGP_ID>:KEY_SGP
+python manage.py cosign_ledger --sealer-id <JKT_ID> --key-env KEY_JKT   # di kedua region juga
+```
+
+`seal_next_block()` memakai `pg_try_advisory_xact_lock`: hanya satu proses yang menyegel sebuah blok,
+yang lain langsung mundur (standby) dan mencoba lagi `--sleep` detik kemudian. Bila sealer aktif mati,
+lock lepas bersama koneksinya dan region lain otomatis melanjutkan chain yang sama; `cosign_ledger`
+di region pertama melengkapi signature-nya setelah hidup lagi. Tidak perlu leader election.
+
 ## Performance Impact
 
 - **Signing**: ~0.1ms per signature (Ed25519 sangat cepat)
@@ -693,4 +748,5 @@ Karena itu jalankan aplikasi dengan role biasa (bukan superuser / pemilik tabel)
 - [x] Anchoring checkpoint eksternal + fork detection
 - [x] Signature sealer di light-client proof (verify_proof dengan trusted_keys)
 - [x] Trigger append-only DB untuk audit log, co-signature, anchor, dan sealer key
+- [x] Produksi 2-of-2 region, watchtower per region, failover sealer
 - [ ] Backend anchor OpenTimestamps / transparency log

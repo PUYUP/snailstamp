@@ -894,7 +894,8 @@ def pending_cosign_blocks(sealer_id, limit=100):
 @dataclass(frozen=True)
 class ForkFinding:
     kind: str            # missing_block | hash_mismatch | equivocation | invalid_checkpoint |
-                         # anchor_conflict | chain_invalid | backend_error
+                         # anchor_conflict | chain_invalid | backend_error | stale_chain |
+                         # cosign_lag | witness_refused
     block_no: int | None
     backend: str
     detail: str
@@ -934,39 +935,101 @@ def checkpoint_for_block(block):
                               window_end_us=_micros(block.window_end), signatures=sigs)
 
 
-def anchor_blocks(force=False, backends=None):
-    """Terbitkan checkpoint blok terbaru ke tiap backend anchor.
+def _signed_enough(block, threshold=None, min_regions=None):
+    """Sama dengan aturan verify_blocks(): blok memenuhi threshold signature / region."""
+    if not (_signatures_required() or block.signatures or block.cosignatures.exists()):
+        return True
+    return verify_block_signatures(block, threshold=threshold, min_regions=min_regions)[0]
 
-    Per backend: hanya bila sudah >= settings.LEDGER_ANCHOR_INTERVAL (default 100) blok sejak anchor
-    terakhir backend itu (atau force=True). Sebelum menerbitkan, chain sejak anchor terakhir
-    diverifikasi ulang (termasuk signature) -- ledger yang rusak tidak pernah di-anchor.
+
+def latest_fully_signed_block(after=0, threshold=None, min_regions=None):
+    """Blok tertinggi N > after sehingga SEMUA blok after+1..N sudah memenuhi threshold signature
+    (BLOCK_SIGNATURE_THRESHOLD / LEDGER_SEALER_MIN_REGIONS). None bila blok after+1 belum lengkap."""
+    good = None
+    for block in Block.objects.filter(block_no__gt=after).order_by("block_no").iterator(chunk_size=500):
+        if not _signed_enough(block, threshold, min_regions):
+            break
+        good = block
+    return good
+
+
+def _cosign_lag():
+    return timedelta(seconds=getattr(settings, "LEDGER_MAX_COSIGN_LAG", 300))
+
+
+def anchor_blocks(force=False, backends=None, interval=None):
+    """Terbitkan checkpoint blok terakhir yang signature-nya SUDAH LENGKAP ke tiap backend anchor.
+
+    Dengan threshold multi-region, blok terbaru biasanya belum di-co-sign region lain; yang di-anchor
+    adalah blok tertinggi yang dia dan semua pendahulunya sudah memenuhi threshold. Bila sebuah blok
+    tertahan lebih lama dari LEDGER_MAX_COSIGN_LAG (default 300 dtk) -> InvalidState.
+
+    Per backend: hanya bila sudah >= interval (default settings.LEDGER_ANCHOR_INTERVAL = 100) blok
+    sejak anchor terakhir backend itu (atau force=True). Sebelum menerbitkan, chain sejak anchor
+    terakhir diverifikasi ulang -- ledger yang rusak tidak pernah di-anchor.
 
     Returns:
         list BlockAnchor yang baru dibuat
     """
     backends = anchors.get_backends() if backends is None else backends
-    latest = Block.objects.order_by("-block_no").first()
-    if latest is None or not backends:
+    if not backends:
         return []
-    interval = max(1, getattr(settings, "LEDGER_ANCHOR_INTERVAL", 100) or 1)
-    checkpoint, verified_from, created = checkpoint_for_block(latest), None, []
+    interval = max(1, interval or getattr(settings, "LEDGER_ANCHOR_INTERVAL", 100) or 1)
+    last_nos = {}
     for backend in backends:
         last = BlockAnchor.objects.filter(backend=backend.name).order_by("-block_no").first()
-        last_no = last.block_no if last else 0
-        if latest.block_no <= last_no or (not force and latest.block_no - last_no < interval):
+        if last:
+            block = Block.objects.filter(pk=last.block_no).first()
+            if block is None or bytes(block.block_hash).hex() != last.block_hash:
+                raise InvalidState(f"Blok #{last.block_no} berbeda dari anchor {backend.name}; menolak anchor")
+        last_nos[backend.name] = last.block_no if last else 0
+
+    start = min(last_nos.values()) + 1
+    target = latest_fully_signed_block(after=start - 1)
+    stuck = Block.objects.filter(block_no=(target.block_no if target else start - 1) + 1).first()
+    if stuck and stuck.sealed_at < datetime.now(timezone.utc) - _cosign_lag():
+        raise InvalidState(f"Blok #{stuck.block_no} belum memenuhi threshold signature lebih dari "
+                           f"{_cosign_lag()}; menolak anchor")
+    if target is None:
+        return []
+    ok, bad = verify_blocks(first=start, last=target.block_no)
+    if not ok:
+        raise InvalidState(f"Blok #{bad} gagal verifikasi; menolak anchor")
+
+    checkpoint, created = checkpoint_for_block(target), []
+    for backend in backends:
+        last_no = last_nos[backend.name]
+        if target.block_no <= last_no or (not force and target.block_no - last_no < interval):
             continue
-        if last and bytes(Block.objects.get(pk=last.block_no).block_hash).hex() != last.block_hash:
-            raise InvalidState(f"Blok #{last.block_no} berbeda dari anchor {backend.name}; menolak anchor")
-        start = last_no + 1
-        if verified_from is None or start < verified_from:
-            ok, bad = verify_blocks(first=start, last=latest.block_no)
-            if not ok:
-                raise InvalidState(f"Blok #{bad} gagal verifikasi; menolak anchor")
-            verified_from = start
         receipt = backend.publish(checkpoint)
-        created.append(BlockAnchor.objects.create(block_no=latest.block_no, block_hash=checkpoint.block_hash,
+        created.append(BlockAnchor.objects.create(block_no=target.block_no, block_hash=checkpoint.block_hash,
                                                   backend=backend.name, receipt=receipt))
     return created
+
+
+def ledger_health(max_block_age=None, max_cosign_lag=None):
+    """Kesehatan sealer untuk watchtower.
+
+    stale_chain: jendela blok terakhir sudah lebih tua dari max_block_age (default
+                 LEDGER_MAX_BLOCK_AGE = 60 dtk) -> semua sealer mati / tertinggal.
+    cosign_lag:  blok yang disegel lebih dari max_cosign_lag lalu (default LEDGER_MAX_COSIGN_LAG
+                 = 300 dtk) belum memenuhi threshold signature -> co-signer region lain mati.
+    """
+    now = datetime.now(timezone.utc)
+    if max_block_age is None:
+        max_block_age = timedelta(seconds=getattr(settings, "LEDGER_MAX_BLOCK_AGE", 60))
+    max_cosign_lag = _cosign_lag() if max_cosign_lag is None else max_cosign_lag
+    findings = []
+    latest = Block.objects.order_by("-block_no").first()
+    if latest and now - latest.window_end > max_block_age:
+        findings.append(ForkFinding("stale_chain", latest.block_no, "",
+                                    f"jendela blok terakhir berakhir {latest.window_end.isoformat()}; "
+                                    f"sealer mati / tertinggal lebih dari {max_block_age}"))
+    old = Block.objects.filter(sealed_at__lte=now - max_cosign_lag).order_by("-block_no").first()
+    if old and not _signed_enough(old):
+        findings.append(ForkFinding("cosign_lag", old.block_no, "",
+                                    f"belum memenuhi threshold signature lebih dari {max_cosign_lag}"))
+    return findings
 
 
 def detect_forks(backends=None, verify_chain=True):

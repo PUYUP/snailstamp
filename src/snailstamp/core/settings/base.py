@@ -220,3 +220,21 @@ if env('LEDGER_ANCHOR_URL', default=''):
         'BACKEND': 'snailstamp.apps.ledger.anchors.HttpAnchorBackend',
         'OPTIONS': {'url': env('LEDGER_ANCHOR_URL'), 'token_env': 'LEDGER_ANCHOR_TOKEN'},
     })
+
+# Multi-sealer: produksi sebaiknya 2 signature dari 2 region (lihat `manage.py check --deploy`)
+BLOCK_SIGNATURE_THRESHOLD = env.int('BLOCK_SIGNATURE_THRESHOLD', default=1)
+LEDGER_SEALER_MIN_REGIONS = env.int('LEDGER_SEALER_MIN_REGIONS', default=1)
+LEDGER_SEALER_REGION = env('LEDGER_SEALER_REGION', default='')
+
+# Watchtower (manage.py watch_ledger)
+LEDGER_MAX_BLOCK_AGE = env.int('LEDGER_MAX_BLOCK_AGE', default=60)       # detik
+LEDGER_MAX_COSIGN_LAG = env.int('LEDGER_MAX_COSIGN_LAG', default=300)    # detik
+LEDGER_WITNESS_INTERVAL = env.int('LEDGER_WITNESS_INTERVAL', default=1)
+LEDGER_ALERT_WEBHOOK = env('LEDGER_ALERT_WEBHOOK', default='')
+LEDGER_WITNESS_BACKENDS = []
+if env('LEDGER_WITNESS_FILE', default=''):
+    LEDGER_WITNESS_BACKENDS.append({
+        'NAME': f"witness-{LEDGER_SEALER_REGION or 'local'}",
+        'BACKEND': 'snailstamp.apps.ledger.anchors.FileAnchorBackend',
+        'OPTIONS': {'path': env('LEDGER_WITNESS_FILE')},
+    })

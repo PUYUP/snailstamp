@@ -6,4 +6,4 @@ class LedgerConfig(AppConfig):
     label = "ledger"
 
     def ready(self) -> None:
-        pass
+        from . import checks  # noqa: F401  (daftarkan system check)
