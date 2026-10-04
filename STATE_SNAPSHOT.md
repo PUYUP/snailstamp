@@ -327,6 +327,7 @@ state = get_state_at_time(
 - Append-only history dengan state snapshot
 - Bisa rekonstruksi penuh dari genesis
 - Bukti integritas via hash chain
+- Block yang berisi log ditandatangai secara kriptografis oleh sealer (lihat BLOCK_SIGNING.md)
 
 ## Performance Considerations
 

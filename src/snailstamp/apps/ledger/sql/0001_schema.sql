@@ -246,6 +246,7 @@ CREATE TABLE ledger_blocks (
     prev_block_hash bytea       NOT NULL,
     block_hash      bytea       NOT NULL,
     sealed_at       timestamptz NOT NULL DEFAULT now(),
+    signatures      jsonb,      -- Array of sealer signatures for multi-sig [{"sealer_id": "uuid", "public_key": "hex", "signature": "hex"}]
     CHECK (window_end > window_start)
 );
 

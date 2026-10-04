@@ -11,6 +11,9 @@ Identitas: association -> member -> user. Ledger hanya mengenal association (pem
 member (yang bertindak); user tidak pernah masuk ledger. Semua FK ke tenant.* tanpa
 constraint fisik (db_constraint=False).
 """
+import uuid
+from datetime import timezone
+
 from django.db import models
 
 
@@ -244,6 +247,102 @@ class Block(LedgerModel):
     prev_block_hash = models.BinaryField()
     block_hash = models.BinaryField()
     sealed_at = models.DateTimeField()
+    signatures = models.JSONField(null=True, default=list)  # List of sealer signatures for multi-sig
 
     class Meta(LedgerModel.Meta):
         db_table = "ledger_blocks"
+
+
+class SealerKey(models.Model):
+    """Tracking sealer keys dengan expiration untuk multi-signature dan rotation.
+
+    Bukan bagian ledger (managed=True) - ini hanya metadata untuk manajemen sealer.
+    """
+    class KeyStatus(models.TextChoices):
+        ACTIVE = 'active', 'Active'
+        EXPIRED = 'expired', 'Expired'
+        REVOKED = 'revoked', 'Revoked'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100)  # Nama sealer (mis: "sealer-1", "sealer-2")
+    public_key = models.CharField(max_length=64)  # Public key hex (32 bytes = 64 hex chars)
+    private_key_encrypted = models.TextField(null=True)  # Private key encrypted (opsional, disimpan terpisah)
+    status = models.CharField(max_length=20, choices=KeyStatus.choices, default=KeyStatus.ACTIVE)
+    valid_from = models.DateTimeField(auto_now_add=True)
+    valid_until = models.DateTimeField(null=True)  # Expiration date, NULL = tidak pernah expired
+    threshold = models.IntegerField(default=1)  # Threshold untuk multi-sig (berapa banyak signature dibutuhkan)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = 'ledger_sealer_keys'
+        ordering = ['-valid_from']
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['valid_until']),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.status})"
+
+    @property
+    def is_active(self):
+        """Cek apakah key masih aktif dan belum expired."""
+        if self.status != self.KeyStatus.ACTIVE:
+            return False
+        if self.valid_until and self.valid_until < timezone.now():
+            return False
+        return True
+
+
+class SealerKeyAuditLog(models.Model):
+    """Audit log untuk sealer key operations (register, rotate, expire, revoke, usage).
+
+    Bukan bagian ledger (managed=True) - ini hanya untuk audit trail dan compliance.
+    """
+    class EventType(models.TextChoices):
+        KEY_REGISTERED = 'key_registered', 'Key Registered'
+        KEY_ROTATED = 'key_rotated', 'Key Rotated'
+        KEY_EXPIRED = 'key_expired', 'Key Expired'
+        KEY_REVOKED = 'key_revoked', 'Key Revoked'
+        KEY_USED = 'key_used', 'Key Used'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event_type = models.CharField(max_length=50, choices=EventType.choices)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    # Actor info (siapa yang melakukan operasi)
+    actor_user_id = models.CharField(max_length=100, null=True, blank=True)
+    actor_email = models.CharField(max_length=255, null=True, blank=True)
+    actor_ip = models.GenericIPAddressField(null=True, blank=True)
+    actor_user_agent = models.TextField(null=True, blank=True)
+
+    # Sealer info
+    sealer_id = models.UUIDField(null=True, blank=True)
+    sealer_name = models.CharField(max_length=100, null=True, blank=True)
+
+    # Key info
+    old_key_id = models.UUIDField(null=True, blank=True)
+    new_key_id = models.UUIDField(null=True, blank=True)
+    old_public_key = models.CharField(max_length=64, null=True, blank=True)
+    new_public_key = models.CharField(max_length=64, null=True, blank=True)
+
+    # Event details
+    rotation_reason = models.CharField(max_length=100, null=True, blank=True)
+    previous_valid_until = models.DateTimeField(null=True, blank=True)
+    new_valid_until = models.DateTimeField(null=True, blank=True)
+    block_at_rotation = models.BigIntegerField(null=True, blank=True)
+
+    # Metadata
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = 'ledger_sealer_audit_logs'
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['event_type'], name='ledger_audit_event_idx'),
+            models.Index(fields=['sealer_id'], name='ledger_audit_sealer_idx'),
+            models.Index(fields=['timestamp'], name='ledger_audit_time_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.event_type} - {self.sealer_name or 'Unknown'} at {self.timestamp}"

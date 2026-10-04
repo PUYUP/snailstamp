@@ -18,7 +18,7 @@ Sistem asset management untuk SnailStamp memungkinkan upload dan tracking file (
    - Path structure: `assets/ab/cdef1234567890...` (2 karakter pertama sebagai folder)
 
 3. **Two-Layer System**
-   - **Asset Model** (non-ledger): Index untuk lookup cepat, tracking version
+   - **Asset Model** (non-ledger): Index untuk lookup cepat, tracking file
    - **Ledger Log** (ACTED_ON): Bukti integritas yang immutable
 
 4. **Storage Backend**
@@ -84,10 +84,10 @@ asset_id, seq = upload_asset(
 print(f"Asset ID: {asset_id}, Log Seq: {seq}")
 ```
 
-### 2. Upload dengan Replace (Versioning)
+### 2. Upload dengan Replace
 
 ```python
-# Upload versi baru, mengganti versi lama
+# Upload file baru, mengganti asset lama (one-to-one)
 asset_id, seq = upload_asset(
     collection_id=collection_id,
     actor_id=association_id,
@@ -95,7 +95,7 @@ asset_id, seq = upload_asset(
     file_obj=file_obj,
     original_filename='photo_v2.jpg',
     mime_type='image/jpeg',
-    replace_existing=True  # Ganti asset lama yang active
+    replace_existing=True  # Hapus asset lama, buat baru
 )
 ```
 
@@ -120,21 +120,16 @@ else:
 ### 4. Get Asset Info
 
 ```python
-from snailstamp.apps.ledger.services import get_asset, get_asset_versions
+from snailstamp.apps.ledger.services import get_asset
 
-# Ambil asset terbaru untuk collection
+# Ambil asset untuk collection (one-to-one)
 asset = get_asset(collection_id)
 if asset:
     print(f"Filename: {asset.original_filename}")
     print(f"Size: {asset.file_size} bytes")
     print(f"Hash: {asset.content_hash}")
-    print(f"Version: {asset.version}")
+    print(f"Status: {asset.status}")
     print(f"URL: {asset.file_url}")
-
-# Ambil semua versi asset
-versions = get_asset_versions(collection_id)
-for asset in versions:
-    print(f"v{asset.version}: {asset.original_filename} ({asset.status})")
 ```
 
 ### 5. Download File
@@ -238,13 +233,14 @@ https://cdn.yourdomain.com/assets/ab/cdef1234567890...
 1. **Private Storage**: Default ACL S3 = private (bukan public)
 2. **Signed URLs**: Gunakan presigned URL untuk temporary access
 3. **Content Hash**: Integritas file diverifikasi via ledger, bukan URL
-4. **Version Tracking**: Semua versi file tercatat, tidak bisa dihapus secara diam-diam
+4. **Asset Tracking**: Semua perubahan file tercatat di ledger log (state snapshot)
+5. **Block Signature**: Block yang berisi log ACTED_ON ditandatangai secara kriptografis oleh sealer (lihat BLOCK_SIGNING.md)
 
 ## Performance Optimization
 
 1. **Deduplication**: File dengan hash sama tidak duplikat di storage
 2. **Lazy Loading**: Asset model tidak termasuk dalam ledger query
-3. **Indexing**: Index pada (collection, version), content_hash, status
+3. **Indexing**: Index pada content_hash, status
 4. **Chunked Upload**: Untuk file besar, implement chunked upload (future)
 
 ## Troubleshooting
