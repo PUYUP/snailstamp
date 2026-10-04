@@ -57,6 +57,7 @@ View/API Anda tetap bertugas memastikan **user yang login memang pemegang member
 | `act("write", alat, sasaran, actor_id, actor_member_id, content=...)` | dua item bertemu, dicatat di DUA chain |
 | `item_history / item_uses / item_acted_on / item_creator` | riwayat; `item_creator` = log MINT (association + member pembuat) |
 | `verify_chain`, `verify_blocks`, `build_proof` + `verify_proof` | audit; jalankan KEDUANYA secara berkala |
+| `trusted_sealer_keys` / `export_sealer_keys` | daftar key sealer untuk dipin client: `verify_proof(proof, trusted_keys=...)` |
 
 Isi (teks, foto) tidak pernah masuk ledger, hanya sha256-nya (`verify_content`).
 Kesalahan: `NotFound` / `Forbidden` / `InvalidState` / `InvalidInput`.

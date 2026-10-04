@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import struct
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -1136,7 +1137,8 @@ def build_proof(collection_id, seq):
         row = cur.fetchone()
     keys = ["collection_id", "seq", "event_type", "actor_id", "actor_member_id", "counterparty_id", "created_us",
             "payload_text", "target_id", "target_seq", "action_id", "content_hash_hex"]
-    log = dict(zip(keys, row[:12]))
+    # UUID -> str agar bukti JSON-serializable; _canon_log memakai str() jadi hash tetap sama
+    log = {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in zip(keys, row[:12])}
     # row = 12 kolom log (0..11) + l.hash (12) + hash sebelumnya (13)
     leaf, prev = bytes(row[12]), bytes(row[13])
     with connection.chunked_cursor() as cur:
@@ -1149,12 +1151,48 @@ def build_proof(collection_id, seq):
                   "end_us": _micros(blk.window_end), "log_count": blk.log_count,
                   "merkle_root": bytes(blk.merkle_root).hex(),
                   "prev_block_hash": bytes(blk.prev_block_hash).hex(),
-                  "block_hash": bytes(blk.block_hash).hex()},
+                  "block_hash": bytes(blk.block_hash).hex(),
+                  "signatures": checkpoint_for_block(blk).signatures},
     }
 
 
-def verify_proof(proof):
-    """Murni Python, tanpa DB. Cek: isi log -> hash log -> jalur Merkle -> root -> hash blok."""
+def trusted_sealer_keys():
+    """{public_key_hex: region} semua key sealer yang belum di-revoke, untuk dipin oleh light client.
+
+    Key yang di-rotate / expired tetap dipercaya untuk blok lama; key REVOKED tidak.
+    """
+    return dict(SealerKey.objects.exclude(status=SealerKey.KeyStatus.REVOKED)
+                .values_list("public_key", "region"))
+
+
+def _proof_signers(block_hash, signatures, trusted_keys):
+    """{public_key: region} dari signature valid atas block_hash (hanya key tepercaya bila diberikan)."""
+    if trusted_keys is not None and not isinstance(trusted_keys, dict):
+        trusted_keys = dict.fromkeys(trusted_keys, "")
+    signers = {}
+    for sig in signatures or []:
+        public_key, signature = sig.get("public_key"), sig.get("signature")
+        if not isinstance(public_key, str) or not isinstance(signature, str) or public_key in signers:
+            continue
+        if trusted_keys is not None and public_key not in trusted_keys:
+            continue
+        if _valid_signatures(block_hash, [(public_key, signature)]):
+            # region dari daftar tepercaya; region di dalam bukti tidak diautentikasi
+            signers[public_key] = trusted_keys[public_key] if trusted_keys is not None else ""
+    return signers
+
+
+def verify_proof(proof, trusted_keys=None, threshold=1, min_regions=1):
+    """Murni Python, tanpa DB. Cek: isi log -> hash log -> jalur Merkle -> root -> hash blok -> signature.
+
+    Args:
+        proof: hasil build_proof()
+        trusted_keys: public key sealer yang dipercaya client -- dict {public_key: region} dari
+                      trusted_sealer_keys(), atau iterable public key. None = signature valid dari
+                      key mana pun dihitung (hanya membuktikan blok ditandatangani, BUKAN oleh siapa).
+        threshold: minimum signature valid atas block_hash
+        min_regions: minimum region berbeda (butuh trusted_keys berupa dict)
+    """
     try:
         h = hashlib.sha256(bytes.fromhex(proof["prev_hash"]) + _canon_log(proof["log"])).digest()
         if h.hex() != proof["log_hash"]:
@@ -1167,8 +1205,11 @@ def verify_proof(proof):
         if node.hex() != b["merkle_root"]:
             return False
         expect = _block_hash_us(bytes.fromhex(b["prev_block_hash"]), node, b["start_us"], b["end_us"], b["log_count"])
-        return expect.hex() == b["block_hash"] and b["start_us"] <= proof["log"]["created_us"] < b["end_us"]
-    except (KeyError, ValueError):
+        if expect.hex() != b["block_hash"] or not b["start_us"] <= proof["log"]["created_us"] < b["end_us"]:
+            return False
+        signers = _proof_signers(expect, b.get("signatures"), trusted_keys)
+        return len(signers) >= max(1, threshold) and len(set(signers.values())) >= max(1, min_regions)
+    except (KeyError, TypeError, ValueError):
         return False
 
 

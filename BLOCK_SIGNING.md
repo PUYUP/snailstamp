@@ -547,6 +547,29 @@ python manage.py sealer_shamir check --sealer-id <ID> --share-file a.txt --share
 python manage.py cosign_ledger --sealer-id <ID> --share-file a.txt --share-file b.txt --share-file c.txt
 ```
 
+## Light Client: Bukti dengan Signature Sealer
+
+`build_proof(collection_id, seq)` sekarang menyertakan `block.signatures` (semua signature sealer
+yang valid, embedded + co-signature: `public_key`, `signature`, `region`). `verify_proof()` tetap
+murni Python tanpa DB, dan sekarang juga memeriksa **siapa** yang menandatangani blok:
+
+```python
+# sekali, dari server (atau didistribusikan out-of-band) -> dipin di client
+#   python manage.py export_sealer_keys > trusted_sealers.json
+trusted = svc.trusted_sealer_keys()          # {public_key_hex: region}, tanpa key REVOKED
+
+proof = svc.build_proof(collection_id, seq)   # JSON-serializable
+svc.verify_proof(proof, trusted_keys=trusted)                              # >= 1 sealer tepercaya
+svc.verify_proof(proof, trusted_keys=trusted, threshold=2, min_regions=2)  # multi-region
+```
+
+* Signature diverifikasi atas `block_hash` yang **dihitung ulang** dari log + jalur Merkle, jadi
+  tidak bisa dipindah ke blok lain.
+* Tanpa `trusted_keys`, cukup ada `threshold` signature valid dari key mana pun -- itu hanya
+  membuktikan blok ditandatangani, bukan oleh siapa. Selalu pin `trusted_keys` di client.
+* Region untuk `min_regions` diambil dari daftar tepercaya, bukan dari isi bukti.
+* Key yang di-rotate / expired tetap tepercaya untuk blok lama; key yang di-revoke tidak.
+
 ## Signature Wajib & Anchoring (Fork Detection)
 
 ### Signature wajib
@@ -652,4 +675,5 @@ python manage.py check_forks                # exit code != 0 bila ada temuan -> 
 - [x] Shamir's Secret Sharing untuk private key distribution
 - [x] Signature wajib untuk setiap blok
 - [x] Anchoring checkpoint eksternal + fork detection
+- [x] Signature sealer di light-client proof (verify_proof dengan trusted_keys)
 - [ ] Backend anchor OpenTimestamps / transparency log

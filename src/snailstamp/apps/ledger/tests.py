@@ -178,7 +178,7 @@ class SealerAndProofTests(LedgerTestCase):
             self.assertIsNotNone(proof, (coll, seq))
             self.assertTrue(svc.verify_proof(proof))
         proof = svc.build_proof(self.jurnal, 2)
-        self.assertEqual(proof["log"]["actor_member_id"], self.ayah)
+        self.assertEqual(proof["log"]["actor_member_id"], str(self.ayah))
         proof["log"]["actor_member_id"] = self.kakak                 # ganti pelaku -> bukti batal
         self.assertFalse(svc.verify_proof(proof))
         self.assertTrue(svc.verify_content(self.jurnal, 2, "catatan"))
@@ -732,3 +732,73 @@ class AnchorAndForkDetectionTests(SealerKeyTestCase):
         with self.assertRaises(CommandError):
             call_command("check_forks", stdout=StringIO(), stderr=StringIO())
 
+
+class LightClientSignatureTests(SealerKeyTestCase):
+    def _proof(self):
+        """Segel blok bertanda tangan JKT, return bukti log MINT (sudah lewat JSON, seperti di client)."""
+        self.jkt, self.jkt_key = self._sealer("sealer-jkt", region="ap-southeast-3")
+        self.sgp, self.sgp_key = self._sealer("sealer-sgp", region="ap-southeast-1")
+        _, (coll,) = svc.create_item(self.assoc, self.member, "pena", 1, "pen")
+        time.sleep(2.2)
+        keys = [{"sealer_id": self.jkt.id, "private_key": self.jkt_key}]
+        while svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0), sealer_private_keys=keys):
+            pass
+        self.coll = coll
+        return json.loads(json.dumps(svc.build_proof(coll, 1)))
+
+    def test_proof_carries_signatures_verified_against_pinned_keys(self):
+        proof = self._proof()
+        (sig,) = proof["block"]["signatures"]
+        self.assertEqual((sig["public_key"], sig["region"]), (self.jkt.public_key, "ap-southeast-3"))
+        trusted = svc.trusted_sealer_keys()
+        self.assertTrue(svc.verify_proof(proof, trusted_keys=trusted))
+        self.assertTrue(svc.verify_proof(proof, trusted_keys=[self.jkt.public_key]))
+        self.assertTrue(svc.verify_proof(proof))                   # tanpa pin: cukup ada signature valid
+        self.assertFalse(svc.verify_proof(proof, trusted_keys={self.sgp.public_key: "ap-southeast-1"}))
+        self.assertFalse(svc.verify_proof(proof, trusted_keys=trusted, threshold=2))
+
+        svc.revoke_sealer_key(self.jkt.id)                         # key bocor -> tidak dipercaya lagi
+        self.assertFalse(svc.verify_proof(proof, trusted_keys=svc.trusted_sealer_keys()))
+
+    def test_stripped_forged_or_rogue_signatures_fail(self):
+        proof = self._proof()
+        trusted = svc.trusted_sealer_keys()
+        stripped = json.loads(json.dumps(proof))
+        stripped["block"]["signatures"] = []
+        self.assertFalse(svc.verify_proof(stripped))
+        del stripped["block"]["signatures"]
+        self.assertFalse(svc.verify_proof(stripped))
+        forged = json.loads(json.dumps(proof))
+        forged["block"]["signatures"][0]["signature"] = "00" * 64
+        self.assertFalse(svc.verify_proof(forged, trusted_keys=trusted))
+        rogue_private, rogue_public = svc.generate_sealer_keypair()
+        rogue = json.loads(json.dumps(proof))
+        rogue["block"]["signatures"] = [{"public_key": rogue_public, "region": "ap-southeast-3",
+                                         "signature": nacl_signing.SigningKey(bytes.fromhex(rogue_private)).sign(
+                                             bytes.fromhex(proof["block"]["block_hash"])).signature.hex()}]
+        self.assertTrue(svc.verify_proof(rogue))                   # ditandatangani, tapi oleh siapa?
+        self.assertFalse(svc.verify_proof(rogue, trusted_keys=trusted))
+        wrong_block = json.loads(json.dumps(proof))
+        wrong_block["block"]["block_hash"] = "11" * 32             # signature terikat ke hash blok
+        self.assertFalse(svc.verify_proof(wrong_block))
+
+    def test_multi_region_threshold_uses_trusted_regions(self):
+        proof = self._proof()
+        trusted = svc.trusted_sealer_keys()
+        self.assertFalse(svc.verify_proof(proof, trusted_keys=trusted, threshold=2, min_regions=2))
+        for b in svc.pending_cosign_blocks(self.sgp.id):
+            svc.cosign_block(b.block_no, self.sgp.id, self.sgp_key)
+        proof = json.loads(json.dumps(svc.build_proof(self.coll, 1)))
+        self.assertEqual({s["region"] for s in proof["block"]["signatures"]}, {"ap-southeast-1", "ap-southeast-3"})
+        self.assertTrue(svc.verify_proof(proof, trusted_keys=trusted, threshold=2, min_regions=2))
+        for sig in proof["block"]["signatures"]:
+            sig["region"] = "palsu"                                # region di bukti tidak dipercaya
+        self.assertTrue(svc.verify_proof(proof, trusted_keys=trusted, threshold=2, min_regions=2))
+        same_region = dict.fromkeys(trusted, "ap-southeast-1")
+        self.assertFalse(svc.verify_proof(proof, trusted_keys=same_region, threshold=2, min_regions=2))
+
+    def test_export_sealer_keys_command(self):
+        self._sealer("sealer-1", region="ap-southeast-3")
+        out = StringIO()
+        call_command("export_sealer_keys", stdout=out)
+        self.assertEqual(json.loads(out.getvalue()), svc.trusted_sealer_keys())
