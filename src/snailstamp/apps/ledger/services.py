@@ -22,11 +22,23 @@ from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db import DatabaseError, connection, transaction
 from django.db.models import Q
+from django.utils import timezone as dj_timezone
 from django.utils.module_loading import import_string
 from nacl import signing
 from nacl.encoding import RawEncoder
+from nacl.exceptions import BadSignatureError
 
-from .models import Action, Block, Collection, Kind, Log, SealerKey, SealerKeyAuditLog
+from . import shamir
+from .models import (
+    Action,
+    Block,
+    BlockSignature,
+    Collection,
+    Kind,
+    Log,
+    SealerKey,
+    SealerKeyAuditLog,
+)
 
 
 # ---------------------------------------------------------------- errors
@@ -383,6 +395,60 @@ _LEAVES_SQL = ("SELECT hash FROM ledger_logs WHERE created_at >= %s AND created_
                "ORDER BY created_at, collection_id, seq")
 
 
+def _sealer_region(sealer):
+    return sealer.region if sealer else ""
+
+
+def _actor_fields(actor_info):
+    actor_info = actor_info or {}
+    return {
+        "actor_user_id": actor_info.get("user_id"),
+        "actor_email": actor_info.get("email"),
+        "actor_ip": actor_info.get("ip"),
+        "actor_user_agent": actor_info.get("user_agent"),
+    }
+
+
+def _audit(event_type, sealer=None, actor_info=None, **fields):
+    """Tulis satu baris SealerKeyAuditLog (append-only). Jangan pernah masukkan private key / share."""
+    if sealer is not None:
+        fields.setdefault("sealer_id", sealer.id)
+        fields.setdefault("sealer_name", sealer.name)
+        fields.setdefault("region", sealer.region)
+    return SealerKeyAuditLog.objects.create(event_type=event_type, **_actor_fields(actor_info), **fields)
+
+
+def _latest_block_no():
+    return Block.objects.order_by("-block_no").values_list("block_no", flat=True).first()
+
+
+def _signing_key(private_key):
+    if isinstance(private_key, str):
+        try:
+            private_key = bytes.fromhex(private_key)
+        except ValueError as exc:
+            raise InvalidInput("private_key harus hex") from exc
+    if len(private_key) != 32:
+        raise InvalidInput("private_key harus 32 bytes (Ed25519)")
+    return signing.SigningKey(private_key)
+
+
+def _public_hex(signing_key):
+    return signing_key.verify_key.encode(encoder=RawEncoder).hex()
+
+
+def _active_sealer_for(sealer_id, public_key):
+    try:
+        sealer = SealerKey.objects.get(id=sealer_id)
+    except SealerKey.DoesNotExist:
+        raise InvalidInput(f"Sealer {sealer_id} tidak ditemukan")
+    if not sealer.is_active:
+        raise InvalidInput(f"Sealer {sealer_id} tidak aktif atau sudah expired")
+    if sealer.public_key != public_key:
+        raise InvalidInput(f"Public key tidak cocok dengan sealer {sealer_id}")
+    return sealer
+
+
 def seal_next_block(window=timedelta(seconds=10), safety_lag=timedelta(seconds=2), sealer_private_keys=None):
     """Segel satu blok bila jendela berikutnya sudah aman. Return Block atau None.
 
@@ -395,6 +461,9 @@ def seal_next_block(window=timedelta(seconds=10), safety_lag=timedelta(seconds=2
 
     Returns:
         Block object atau None jika jendela belum aman
+
+    Setiap pemakaian key dicatat sebagai KEY_USED di SealerKeyAuditLog. Sealer di region lain
+    bisa menambah signature belakangan lewat cosign_block().
     """
     with transaction.atomic(), connection.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_xact_lock(%s)", [BLOCK_LOCK_KEY])
@@ -430,60 +499,48 @@ def seal_next_block(window=timedelta(seconds=10), safety_lag=timedelta(seconds=2
         block_hash = _block_hash(prev, root, start, end, count)
 
         # Sign block dengan multi-signature
-        signatures = []
+        signatures, used = [], []
         if sealer_private_keys is not None:
             # Handle legacy single key
             if isinstance(sealer_private_keys, (str, bytes)):
                 sealer_private_keys = [{"sealer_id": None, "private_key": sealer_private_keys}]
 
-            # Handle multiple keys
             for sealer_info in sealer_private_keys:
-                private_key = sealer_info["private_key"]
+                signing_key = _signing_key(sealer_info["private_key"])
                 sealer_id = sealer_info.get("sealer_id")
-
-                if isinstance(private_key, str):
-                    private_key = bytes.fromhex(private_key)
-                if len(private_key) != 32:
-                    raise InvalidInput("private_key harus 32 bytes (Ed25519)")
-
-                # Generate signing key dari private key
-                signing_key = signing.SigningKey(private_key)
-                public_key = signing_key.verify_key.encode(encoder=RawEncoder).hex()
-                signature = signing_key.sign(block_hash, encoder=RawEncoder).signature.hex()
-
-                # Cek sealer_id valid dan aktif
-                if sealer_id:
-                    try:
-                        sealer = SealerKey.objects.get(id=sealer_id)
-                        if not sealer.is_active:
-                            raise InvalidInput(f"Sealer {sealer_id} tidak aktif atau sudah expired")
-                        if sealer.public_key != public_key:
-                            raise InvalidInput(f"Public key tidak cocok dengan sealer {sealer_id}")
-                    except SealerKey.DoesNotExist:
-                        raise InvalidInput(f"Sealer {sealer_id} tidak ditemukan")
-
+                public_key = _public_hex(signing_key)
+                sealer = _active_sealer_for(sealer_id, public_key) if sealer_id else None
                 signatures.append({
                     "sealer_id": str(sealer_id) if sealer_id else None,
                     "public_key": public_key,
-                    "signature": signature
+                    "region": _sealer_region(sealer),
+                    "signature": signing_key.sign(block_hash, encoder=RawEncoder).signature.hex(),
                 })
+                if sealer:
+                    used.append(sealer)
 
         cur.execute(
             "INSERT INTO ledger_blocks (block_no, window_start, window_end, log_count, "
             "merkle_root, prev_block_hash, block_hash, signatures) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
             [block_no, start, end, count, root, prev, block_hash, json.dumps(signatures)])
+        for sealer in used:
+            _audit(SealerKeyAuditLog.EventType.KEY_USED, sealer,
+                   new_key_id=sealer.id, block_at_rotation=block_no,
+                   metadata={"mode": "seal", "block_no": block_no})
     return Block.objects.get(pk=block_no)
 
 
-def verify_blocks(first=1, last=None, verify_signature=True, threshold=None):
+def verify_blocks(first=1, last=None, verify_signature=True, threshold=None, min_regions=None):
     """Hitung ulang Merkle root dari log + cek tautan antar-blok. Return (ok, block_no_rusak).
 
     Args:
         first: Block number pertama untuk verifikasi
         last: Block number terakhir (None = sampai terakhir)
-        verify_signature: Jika True, verifikasi signature sealer jika ada
-        threshold: Minimum signature valid yang dibutuhkan (None = default 1)
+        verify_signature: Jika True, verifikasi signature sealer (embedded + co-signature) jika ada
+        threshold: Minimum signature valid yang dibutuhkan (None = settings.BLOCK_SIGNATURE_THRESHOLD / 1)
+        min_regions: Minimum region berbeda di antara signature valid
+                     (None = settings.LEDGER_SEALER_MIN_REGIONS / 1)
 
     Returns:
         (ok, block_no_rusak) - ok=True jika semua valid, block_no_rusak jika ada error
@@ -506,46 +563,11 @@ def verify_blocks(first=1, last=None, verify_signature=True, threshold=None):
                 or bytes(b.block_hash) != _block_hash(prev, root, b.window_start, b.window_end, count)):
             return False, b.block_no
 
-        # Verifikasi signature jika ada dan verify_signature=True
-        if verify_signature:
-            valid_count = 0
-
-            # New: cek signatures field (multi-sig)
-            if b.signatures:
-                for sig in b.signatures:
-                    try:
-                        public_key = sig.get('public_key')
-                        signature = sig.get('signature')
-                        sealer_id = sig.get('sealer_id')
-
-                        # Cek apakah sealer masih aktif
-                        if sealer_id:
-                            try:
-                                sealer = SealerKey.objects.get(id=sealer_id)
-                                if not sealer.is_active:
-                                    continue  # Skip expired/revoked sealer
-                            except SealerKey.DoesNotExist:
-                                continue  # Skip unknown sealer
-
-                        verify_key = signing.VerifyKey(bytes.fromhex(public_key), encoder=RawEncoder)
-                        verify_key.verify(bytes(b.block_hash), bytes.fromhex(signature), encoder=RawEncoder)
-                        valid_count += 1
-                    except Exception:
-                        continue  # Skip invalid signature
-
-                # Cek threshold
-                block_threshold = threshold or 1
-                if valid_count < block_threshold:
-                    return False, b.block_no
-
-            # Legacy: cek field lama untuk backward compatibility
-            elif hasattr(b, 'sealer_public_key') and hasattr(b, 'sealer_signature'):
-                if b.sealer_public_key is not None and b.sealer_signature is not None:
-                    try:
-                        verify_key = signing.VerifyKey(bytes(b.sealer_public_key), encoder=RawEncoder)
-                        verify_key.verify(bytes(b.block_hash), bytes(b.sealer_signature), encoder=RawEncoder)
-                    except Exception:
-                        return False, b.block_no
+        # Blok tanpa signature sama sekali (blok lama) tetap lolos demi kompatibilitas.
+        if verify_signature and (b.signatures or b.cosignatures.exists()):
+            ok, _ = verify_block_signatures(b, threshold=threshold, min_regions=min_regions)
+            if not ok:
+                return False, b.block_no
 
         prev = bytes(b.block_hash)
     return True, None
@@ -566,38 +588,25 @@ def generate_sealer_keypair():
 def verify_block_signature(block, public_key_hex):
     """Verifikasi signature sebuah block dengan public key tertentu (deprecated, gunakan verify_block_signatures).
 
-    Args:
-        block: Block object
-        public_key_hex: Public key sealer (hex string)
-
     Returns:
-        True jika signature valid, False jika tidak valid atau tidak ada signature
+        True jika ada signature valid dari public key ini (embedded atau co-signature)
     """
-    # Legacy: cek field lama untuk backward compatibility
-    if hasattr(block, 'sealer_public_key') and hasattr(block, 'sealer_signature'):
-        if block.sealer_public_key is None or block.sealer_signature is None:
-            return False
-        try:
-            verify_key = signing.VerifyKey(bytes.fromhex(public_key_hex), encoder=RawEncoder)
-            verify_key.verify(bytes(block.block_hash), bytes(block.sealer_signature), encoder=RawEncoder)
-            return True
-        except Exception:
-            return False
-
-    # New: cek signatures field (multi-sig)
-    if block.signatures:
-        for sig in block.signatures:
-            if sig.get('public_key') == public_key_hex:
-                try:
-                    verify_key = signing.VerifyKey(bytes.fromhex(public_key_hex), encoder=RawEncoder)
-                    verify_key.verify(bytes(block.block_hash), bytes.fromhex(sig['signature']), encoder=RawEncoder)
-                    return True
-                except Exception:
-                    return False
-    return False
+    candidates = [s.get("signature") for s in (block.signatures or []) if s.get("public_key") == public_key_hex]
+    candidates += list(block.cosignatures.filter(public_key=public_key_hex).values_list("signature", flat=True))
+    return any(_signature_ok(block, public_key_hex, sig) for sig in candidates)
 
 
-def register_sealer(name, public_key_hex, valid_until=None, threshold=1, metadata=None, actor_info=None):
+def _validate_public_key(public_key_hex):
+    try:
+        if len(public_key_hex) != 64:
+            raise ValueError
+        signing.VerifyKey(bytes.fromhex(public_key_hex), encoder=RawEncoder)
+    except (TypeError, ValueError) as exc:
+        raise InvalidInput("public_key_hex harus 64 chars (32 bytes hex)") from exc
+
+
+def register_sealer(name, public_key_hex, valid_until=None, threshold=1, metadata=None, actor_info=None,
+                    region=None):
     """Register sealer baru dengan key pair.
 
     Args:
@@ -607,132 +616,312 @@ def register_sealer(name, public_key_hex, valid_until=None, threshold=1, metadat
         threshold: Threshold untuk multi-sig (berapa banyak signature dibutuhkan)
         metadata: Dictionary metadata tambahan
         actor_info: Dictionary actor info {"user_id": "...", "email": "...", "ip": "...", "user_agent": "..."}
+        region: Region sealer (mis: "ap-southeast-1"); None = settings.LEDGER_SEALER_REGION / ""
 
     Returns:
         SealerKey object
     """
-    if len(public_key_hex) != 64:
-        raise InvalidInput("public_key_hex harus 64 chars (32 bytes hex)")
+    _validate_public_key(public_key_hex)
+    if region is None:
+        region = getattr(settings, "LEDGER_SEALER_REGION", "") or ""
 
-    sealer = SealerKey.objects.create(
-        name=name,
-        public_key=public_key_hex,
-        valid_until=valid_until,
-        threshold=threshold,
-        metadata=metadata or {}
-    )
-
-    # Log audit event
-    SealerKeyAuditLog.objects.create(
-        event_type=SealerKeyAuditLog.EventType.KEY_REGISTERED,
-        sealer_id=sealer.id,
-        sealer_name=name,
-        new_key_id=sealer.id,
-        new_public_key=public_key_hex,
-        new_valid_until=valid_until,
-        actor_user_id=actor_info.get("user_id") if actor_info else None,
-        actor_email=actor_info.get("email") if actor_info else None,
-        actor_ip=actor_info.get("ip") if actor_info else None,
-        actor_user_agent=actor_info.get("user_agent") if actor_info else None,
-        metadata=metadata or {}
-    )
-
+    with transaction.atomic():
+        sealer = SealerKey.objects.create(
+            name=name,
+            public_key=public_key_hex,
+            valid_until=valid_until,
+            threshold=threshold,
+            region=region,
+            metadata=metadata or {}
+        )
+        _audit(SealerKeyAuditLog.EventType.KEY_REGISTERED, sealer, actor_info,
+               new_key_id=sealer.id, new_public_key=public_key_hex, new_valid_until=valid_until,
+               metadata=metadata or {})
     return sealer
 
 
-def get_active_sealers():
-    """Ambil semua sealer yang aktif dan belum expired.
+def get_active_sealers(region=None):
+    """Ambil semua sealer yang aktif dan belum expired (opsional: hanya satu region).
 
     Returns:
         QuerySet of SealerKey objects
     """
-    now = timezone.now()
-    return SealerKey.objects.filter(
+    qs = SealerKey.objects.filter(
         status=SealerKey.KeyStatus.ACTIVE
     ).filter(
-        Q(valid_until__isnull=True) | Q(valid_until__gt=now)
+        Q(valid_until__isnull=True) | Q(valid_until__gt=dj_timezone.now())
     )
+    if region is not None:
+        qs = qs.filter(region=region)
+    return qs
 
 
-def rotate_sealer_key(sealer_id, new_public_key_hex, valid_until=None):
+def rotate_sealer_key(sealer_id, new_public_key_hex, valid_until=None, reason="scheduled", actor_info=None):
     """Rotate key untuk sealer yang ada.
+
+    Key lama ditandai EXPIRED (deactivated_at = sekarang) tapi signature lamanya tetap sah untuk
+    blok yang disegel sebelum rotasi. Rotasi dicatat sebagai KEY_ROTATED di SealerKeyAuditLog.
 
     Args:
         sealer_id: ID SealerKey yang akan di-rotate
         new_public_key_hex: Public key baru (hex string, 64 chars)
         valid_until: Expiration date baru (None = tidak pernah expired)
+        reason: Alasan rotasi (mis: "scheduled", "compromised", "expiring", "manual")
+        actor_info: Lihat register_sealer()
 
     Returns:
         SealerKey object baru
     """
-    old_key = SealerKey.objects.get(id=sealer_id)
+    _validate_public_key(new_public_key_hex)
+    with transaction.atomic():
+        try:
+            old_key = SealerKey.objects.select_for_update().get(id=sealer_id)
+        except SealerKey.DoesNotExist:
+            raise NotFound(f"Sealer {sealer_id} tidak ditemukan")
+        if old_key.status == SealerKey.KeyStatus.REVOKED:
+            raise InvalidState(f"Sealer {sealer_id} sudah di-revoke; register key baru")
+        if old_key.successors.exists():
+            raise InvalidState(f"Sealer {sealer_id} sudah di-rotate sebelumnya")
+        if old_key.public_key == new_public_key_hex:
+            raise InvalidInput("Public key baru sama dengan key lama")
 
-    # Mark old key as expired
-    old_key.status = SealerKey.KeyStatus.EXPIRED
-    old_key.save()
+        now = dj_timezone.now()
+        previous_valid_until = old_key.valid_until
+        old_key.status = SealerKey.KeyStatus.EXPIRED
+        old_key.deactivated_at = old_key.deactivated_at or now
+        old_key.save(update_fields=["status", "deactivated_at"])
 
-    # Create new key dengan nama yang sama
-    return SealerKey.objects.create(
-        name=old_key.name,
-        public_key=new_public_key_hex,
-        valid_until=valid_until,
-        threshold=old_key.threshold,
-        metadata=old_key.metadata
-    )
+        new_key = SealerKey.objects.create(
+            name=old_key.name,
+            public_key=new_public_key_hex,
+            valid_until=valid_until,
+            threshold=old_key.threshold,
+            region=old_key.region,
+            metadata=old_key.metadata,
+            previous_key=old_key,
+        )
+        _audit(SealerKeyAuditLog.EventType.KEY_ROTATED, old_key, actor_info,
+               old_key_id=old_key.id, new_key_id=new_key.id,
+               old_public_key=old_key.public_key, new_public_key=new_public_key_hex,
+               rotation_reason=reason, previous_valid_until=previous_valid_until,
+               new_valid_until=valid_until, block_at_rotation=_latest_block_no())
+    return new_key
 
 
-def expire_old_keys():
-    """Mark key yang sudah expired sebagai EXPIRED status.
+def revoke_sealer_key(sealer_id, reason="compromised", actor_info=None):
+    """Revoke key (mis. bocor). Signature dari key REVOKED tidak dihitung lagi, termasuk blok lama.
+
+    Returns:
+        SealerKey yang di-revoke
+    """
+    with transaction.atomic():
+        try:
+            key = SealerKey.objects.select_for_update().get(id=sealer_id)
+        except SealerKey.DoesNotExist:
+            raise NotFound(f"Sealer {sealer_id} tidak ditemukan")
+        if key.status == SealerKey.KeyStatus.REVOKED:
+            raise InvalidState(f"Sealer {sealer_id} sudah di-revoke")
+        key.status = SealerKey.KeyStatus.REVOKED
+        key.deactivated_at = key.deactivated_at or dj_timezone.now()
+        key.save(update_fields=["status", "deactivated_at"])
+        _audit(SealerKeyAuditLog.EventType.KEY_REVOKED, key, actor_info,
+               old_key_id=key.id, old_public_key=key.public_key, rotation_reason=reason,
+               previous_valid_until=key.valid_until, block_at_rotation=_latest_block_no())
+    return key
+
+
+def expire_old_keys(actor_info=None):
+    """Mark key yang sudah expired sebagai EXPIRED status (dicatat sebagai KEY_EXPIRED).
 
     Returns:
         Number of keys yang diupdate
     """
-    now = timezone.now()
-    count = SealerKey.objects.filter(
-        status=SealerKey.KeyStatus.ACTIVE,
-        valid_until__isnull=False,
-        valid_until__lt=now
-    ).update(status=SealerKey.KeyStatus.EXPIRED)
+    count = 0
+    with transaction.atomic():
+        keys = SealerKey.objects.select_for_update().filter(
+            status=SealerKey.KeyStatus.ACTIVE,
+            valid_until__isnull=False,
+            valid_until__lt=dj_timezone.now()
+        )
+        block_no = _latest_block_no()
+        for key in keys:
+            key.status = SealerKey.KeyStatus.EXPIRED
+            key.deactivated_at = key.valid_until
+            key.save(update_fields=["status", "deactivated_at"])
+            _audit(SealerKeyAuditLog.EventType.KEY_EXPIRED, key, actor_info,
+                   old_key_id=key.id, old_public_key=key.public_key,
+                   previous_valid_until=key.valid_until, block_at_rotation=block_no)
+            count += 1
     return count
 
 
-def verify_block_signatures(block, threshold=None):
-    """Verifikasi multi-signature sebuah block dengan threshold.
+def sealer_audit_trail(sealer_name=None, sealer_id=None, event_type=None, region=None, since=None):
+    """Query audit log sealer (terbaru dulu). Semua filter opsional."""
+    qs = SealerKeyAuditLog.objects.all()
+    if sealer_name is not None:
+        qs = qs.filter(sealer_name=sealer_name)
+    if sealer_id is not None:
+        qs = qs.filter(Q(sealer_id=sealer_id) | Q(old_key_id=sealer_id) | Q(new_key_id=sealer_id))
+    if event_type is not None:
+        qs = qs.filter(event_type=event_type)
+    if region is not None:
+        qs = qs.filter(region=region)
+    if since is not None:
+        qs = qs.filter(timestamp__gte=since)
+    return qs
+
+
+def _signature_ok(block, public_key_hex, signature_hex):
+    try:
+        verify_key = signing.VerifyKey(bytes.fromhex(public_key_hex), encoder=RawEncoder)
+        verify_key.verify(bytes(block.block_hash), bytes.fromhex(signature_hex), encoder=RawEncoder)
+        return True
+    except (BadSignatureError, TypeError, ValueError):
+        return False
+
+
+def _block_signature_candidates(block):
+    """(sealer_id|None, public_key, signature, signed_at) dari Block.signatures + BlockSignature."""
+    for sig in block.signatures or []:
+        yield sig.get("sealer_id"), sig.get("public_key"), sig.get("signature"), block.sealed_at
+    for cs in block.cosignatures.all():
+        yield cs.sealer_id, cs.public_key, cs.signature, cs.signed_at
+
+
+def valid_block_signers(block):
+    """Daftar SealerKey yang signature-nya valid untuk blok ini (unik per public key).
+
+    Signature hanya dihitung bila: public key cocok dengan SealerKey terdaftar, key tersebut sah
+    pada saat menandatangani (lihat SealerKey.was_valid_at), dan signature Ed25519-nya valid.
+    """
+    seen, signers = set(), []
+    for sealer_id, public_key, signature, signed_at in _block_signature_candidates(block):
+        if not public_key or not signature or public_key in seen:
+            continue
+        lookup = {"id": sealer_id} if sealer_id else {"public_key": public_key}
+        sealer = SealerKey.objects.filter(**lookup).order_by("valid_from").first()
+        if sealer is None or sealer.public_key != public_key or not sealer.was_valid_at(signed_at):
+            continue
+        if _signature_ok(block, public_key, signature):
+            seen.add(public_key)
+            signers.append(sealer)
+    return signers
+
+
+def verify_block_signatures(block, threshold=None, min_regions=None):
+    """Verifikasi multi-signature sebuah block dengan threshold (dan jumlah region minimum).
 
     Args:
         block: Block object
-        threshold: Minimum signature valid yang dibutuhkan (None = 1)
+        threshold: Minimum signature valid (None = settings.BLOCK_SIGNATURE_THRESHOLD / 1)
+        min_regions: Minimum region berbeda (None = settings.LEDGER_SEALER_MIN_REGIONS / 1)
 
     Returns:
         (valid, count) - valid=True jika cukup signature valid, count=jumlah signature valid
     """
-    if not block.signatures:
-        return False, 0
+    signers = valid_block_signers(block)
+    required = threshold or getattr(settings, "BLOCK_SIGNATURE_THRESHOLD", 1) or 1
+    regions_required = min_regions or getattr(settings, "LEDGER_SEALER_MIN_REGIONS", 1) or 1
+    regions = {s.region for s in signers}
+    return len(signers) >= required and len(regions) >= regions_required, len(signers)
 
-    valid_count = 0
-    for sig in block.signatures:
-        try:
-            public_key = sig.get('public_key')
-            signature = sig.get('signature')
-            sealer_id = sig.get('sealer_id')
 
-            # Cek apakah sealer masih aktif
-            if sealer_id:
-                try:
-                    sealer = SealerKey.objects.get(id=sealer_id)
-                    if not sealer.is_active:
-                        continue  # Skip expired/revoked sealer
-                except SealerKey.DoesNotExist:
-                    continue  # Skip unknown sealer
+# ---------------------------------------------------------------- multi-region co-sign
+def cosign_block(block_no, sealer_id, private_key, actor_info=None):
+    """Tambah signature sealer (biasanya dari region lain) ke blok yang sudah disegel.
 
-            verify_key = signing.VerifyKey(bytes.fromhex(public_key), encoder=RawEncoder)
-            verify_key.verify(bytes(block.block_hash), bytes.fromhex(signature), encoder=RawEncoder)
-            valid_count += 1
-        except Exception:
-            continue  # Skip invalid signature
+    Co-signer memverifikasi ulang Merkle root & tautan blok dari log di database SEBELUM
+    menandatangani, jadi signature-nya adalah kesaksian independen atas isi blok.
 
-    required = threshold or 1
-    return valid_count >= required, valid_count
+    Returns:
+        BlockSignature object
+    """
+    signing_key = _signing_key(private_key)
+    public_key = _public_hex(signing_key)
+    sealer = _active_sealer_for(sealer_id, public_key)
+    try:
+        block = Block.objects.get(pk=block_no)
+    except Block.DoesNotExist:
+        raise NotFound(f"Blok #{block_no} tidak ditemukan")
+    if any(s.get("public_key") == public_key for s in block.signatures or []):
+        raise InvalidState(f"Blok #{block_no} sudah ditandatangani sealer ini")
+    ok, _ = verify_blocks(first=block_no, last=block_no, verify_signature=False)
+    if not ok:
+        raise InvalidState(f"Blok #{block_no} tidak cocok dengan log; menolak co-sign")
+    with transaction.atomic():
+        if BlockSignature.objects.filter(block_id=block_no, sealer=sealer).exists():
+            raise InvalidState(f"Blok #{block_no} sudah ditandatangani sealer ini")
+        cosig = BlockSignature.objects.create(
+            block_id=block_no, sealer=sealer, region=sealer.region, public_key=public_key,
+            signature=signing_key.sign(bytes(block.block_hash), encoder=RawEncoder).signature.hex(),
+        )
+        _audit(SealerKeyAuditLog.EventType.KEY_USED, sealer, actor_info,
+               new_key_id=sealer.id, block_at_rotation=block_no,
+               metadata={"mode": "cosign", "block_no": block_no})
+    return cosig
+
+
+def pending_cosign_blocks(sealer_id, limit=100):
+    """Blok yang belum ditandatangani sealer ini (embedded maupun co-signature), urut naik.
+
+    Sealer region baru juga akan menandatangani ulang riwayat lama (backfill), setelah
+    memverifikasi ulang tiap blok terhadap log.
+    """
+    sealer = SealerKey.objects.get(id=sealer_id)
+    signed = BlockSignature.objects.filter(sealer=sealer).values("block_id")
+    return (Block.objects.exclude(block_no__in=signed)
+            .exclude(signatures__contains=[{"public_key": sealer.public_key}])
+            .order_by("block_no")[:limit])
+
+
+# ---------------------------------------------------------------- Shamir's Secret Sharing
+def split_sealer_private_key(sealer_id, private_key, shares, threshold, actor_info=None):
+    """Pecah private key sealer menjadi `shares` share (butuh `threshold` untuk rekonstruksi).
+
+    Private key harus cocok dengan public key sealer. Yang dicatat di audit log hanya
+    parameter + sidik jari share; share & private key tidak pernah disimpan.
+
+    Returns:
+        list[str] - share untuk dibagikan ke custodian (masing-masing simpan terpisah)
+    """
+    signing_key = _signing_key(private_key)
+    try:
+        sealer = SealerKey.objects.get(id=sealer_id)
+    except SealerKey.DoesNotExist:
+        raise NotFound(f"Sealer {sealer_id} tidak ditemukan")
+    if sealer.public_key != _public_hex(signing_key):
+        raise InvalidInput(f"Private key tidak cocok dengan sealer {sealer_id}")
+    try:
+        result = shamir.split_secret(signing_key.encode(encoder=RawEncoder), shares, threshold)
+    except shamir.ShamirError as exc:
+        raise InvalidInput(str(exc)) from exc
+    _audit(SealerKeyAuditLog.EventType.KEY_SPLIT, sealer, actor_info,
+           metadata={"shares": shares, "threshold": threshold,
+                     "share_set": shamir.parse_share(result[0])[0],
+                     "share_fingerprints": [shamir.share_fingerprint(s) for s in result]})
+    return result
+
+
+def recover_sealer_private_key(sealer_id, shares, actor_info=None):
+    """Rekonstruksi private key sealer dari share Shamir. Return private key hex.
+
+    Hasil diverifikasi terhadap public key sealer, jadi share yang salah / tercampur ditolak.
+    """
+    try:
+        sealer = SealerKey.objects.get(id=sealer_id)
+    except SealerKey.DoesNotExist:
+        raise NotFound(f"Sealer {sealer_id} tidak ditemukan")
+    try:
+        secret = shamir.combine_shares(shares)
+    except shamir.ShamirError as exc:
+        raise InvalidInput(str(exc)) from exc
+    signing_key = _signing_key(secret)
+    if _public_hex(signing_key) != sealer.public_key:
+        raise InvalidInput(f"Share tidak menghasilkan private key sealer {sealer_id}")
+    _audit(SealerKeyAuditLog.EventType.KEY_RECOVERED, sealer, actor_info,
+           metadata={"shares_used": len(shares),
+                     "share_fingerprints": [shamir.share_fingerprint(s) for s in shares]})
+    return secret.hex()
 
 
 # ---------------------------------------------------------------- bukti "tercatat di blok"

@@ -461,6 +461,92 @@ Jika `seal_next_block()` tidak men-generate signature:
 3. Pastikan PyNaCl terinstall (`pip install pynacl`)
 4. Cek apakah sealer_id valid dan aktif
 
+## Audit Log Key Rotation
+
+Semua operasi key dicatat di `SealerKeyAuditLog` (tabel `ledger_sealer_audit_logs`, append-only:
+`save()` pada baris lama, `delete()`, `QuerySet.update()/delete()` melempar `LedgerWriteForbidden`).
+
+| Event | Ditulis oleh | Isi penting |
+|---|---|---|
+| `key_registered` | `register_sealer()` | `new_key_id`, `new_public_key`, `region` |
+| `key_rotated` | `rotate_sealer_key()` | `old_key_id` -> `new_key_id`, public key lama/baru, `rotation_reason`, `block_at_rotation` |
+| `key_revoked` | `revoke_sealer_key()` | `rotation_reason`, `block_at_rotation` |
+| `key_expired` | `expire_old_keys()` | `previous_valid_until` |
+| `key_used` | `seal_next_block()` / `cosign_block()` | `block_at_rotation` = block_no, `metadata.mode` = `seal` / `cosign` |
+| `key_split` / `key_recovered` | Shamir (lihat bawah) | jumlah share, threshold, sidik jari share (bukan share-nya) |
+
+Semua fungsi menerima `actor_info={"user_id", "email", "ip", "user_agent"}`.
+
+```python
+from snailstamp.apps.ledger.services import rotate_sealer_key, revoke_sealer_key, sealer_audit_trail
+
+new_key = rotate_sealer_key(sealer.id, new_public, reason="compromised",
+                            actor_info={"user_id": str(request.user.pk), "ip": request.META["REMOTE_ADDR"]})
+revoke_sealer_key(other.id, reason="leaked")
+for log in sealer_audit_trail(sealer_name="sealer-1"):
+    print(log.timestamp, log.event_type, log.rotation_reason, log.block_at_rotation)
+```
+
+**Rotasi tidak membatalkan riwayat.** Key yang di-rotate/expired tetap sah untuk blok yang
+ditandatangani sebelum `deactivated_at` / `valid_until` (`SealerKey.was_valid_at()`). Key
+`REVOKED` (bocor) tidak pernah dihitung lagi, termasuk untuk blok lama. Signature hanya dihitung
+jika public key-nya cocok dengan `SealerKey` terdaftar, dan satu public key hanya dihitung sekali.
+
+## Multi-Region Sealer
+
+Satu proses `seal_ledger` (pemegang advisory lock) menyegel blok; sealer di region lain
+menambahkan **co-signature** atas `block_hash` yang sama ke `ledger_block_signatures`
+(`ledger_blocks` append-only). Co-signer memverifikasi ulang Merkle root dari log sebelum
+menandatangani.
+
+```python
+sgp = register_sealer("sealer-sgp", pub_sgp, region="ap-southeast-1")
+jkt = register_sealer("sealer-jkt", pub_jkt, region="ap-southeast-3")
+
+# region JKT menyegel
+seal_next_block(sealer_private_keys=[{"sealer_id": jkt.id, "private_key": priv_jkt}])
+# region SGP co-sign semua blok yang belum ia tandatangani
+for block in pending_cosign_blocks(sgp.id):
+    cosign_block(block.block_no, sgp.id, priv_sgp)
+
+verify_blocks(threshold=2, min_regions=2)        # butuh 2 signature dari 2 region berbeda
+```
+
+Sebagai service:
+
+```bash
+# region utama
+python manage.py seal_ledger --sealer <JKT_ID>:BLOCK_SEALER_JKT_PRIVATE_KEY
+# tiap region lain
+python manage.py cosign_ledger --sealer-id <SGP_ID> --key-env BLOCK_SEALER_SGP_PRIVATE_KEY
+```
+
+Settings opsional: `LEDGER_SEALER_REGION` (default region untuk `register_sealer`),
+`BLOCK_SIGNATURE_THRESHOLD`, `LEDGER_SEALER_MIN_REGIONS` (default untuk `verify_blocks` /
+`verify_block_signatures`). Blok lama tanpa signature sama sekali tetap lolos verifikasi.
+
+## Shamir's Secret Sharing
+
+Private key sealer bisa dipecah menjadi N share (butuh K untuk rekonstruksi) dan dibagikan ke
+custodian berbeda; kurang dari K share tidak membocorkan apa pun. Implementasi GF(256) ada di
+`ledger/shamir.py`. Format share: `ss1-<set_id>-<k>-<x>-<hex>-<checksum>`.
+
+```python
+shares = split_sealer_private_key(sealer.id, private_hex, shares=5, threshold=3)
+private_hex = recover_sealer_private_key(sealer.id, [shares[0], shares[2], shares[4]])
+```
+
+Hasil rekonstruksi diverifikasi terhadap public key sealer (share salah/tercampur ditolak). Audit
+log hanya menyimpan sidik jari share.
+
+```bash
+python manage.py sealer_shamir split --sealer-id <ID> --key-env BLOCK_SEALER_1_PRIVATE_KEY \
+    --shares 5 --threshold 3 --out-dir /secure/shares      # satu file per share, mode 0600
+python manage.py sealer_shamir check --sealer-id <ID> --share-file a.txt --share-file b.txt --share-file c.txt
+# sealer/co-signer bisa langsung memakai share (key direkonstruksi di memori, dicatat key_recovered)
+python manage.py cosign_ledger --sealer-id <ID> --share-file a.txt --share-file b.txt --share-file c.txt
+```
+
 ## Performance Impact
 
 - **Signing**: ~0.1ms per signature (Ed25519 sangat cepat)
@@ -491,6 +577,6 @@ Jika `seal_next_block()` tidak men-generate signature:
 - [ ] Hardware Security Module (HSM) integration
 - [ ] Key whitelisting untuk trusted sealers
 - [ ] Webhook notification saat key expired
-- [ ] Audit log untuk key rotation events
-- [ ] Multi-region sealer setup
-- [ ] Shamir's Secret Sharing untuk private key distribution
+- [x] Audit log untuk key rotation events
+- [x] Multi-region sealer setup
+- [x] Shamir's Secret Sharing untuk private key distribution

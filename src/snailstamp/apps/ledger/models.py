@@ -12,9 +12,9 @@ member (yang bertindak); user tidak pernah masuk ledger. Semua FK ke tenant.* ta
 constraint fisik (db_constraint=False).
 """
 import uuid
-from datetime import timezone
 
 from django.db import models
+from django.utils import timezone
 
 
 class LedgerWriteForbidden(RuntimeError):
@@ -272,6 +272,10 @@ class SealerKey(models.Model):
     valid_until = models.DateTimeField(null=True)  # Expiration date, NULL = tidak pernah expired
     threshold = models.IntegerField(default=1)  # Threshold untuk multi-sig (berapa banyak signature dibutuhkan)
     metadata = models.JSONField(default=dict, blank=True)
+    region = models.CharField(max_length=64, blank=True, default="", db_index=True)  # mis: "ap-southeast-1"
+    deactivated_at = models.DateTimeField(null=True, blank=True)  # saat di-rotate / revoke / expire
+    previous_key = models.ForeignKey('self', on_delete=models.PROTECT, null=True, blank=True,
+                                     related_name='successors')  # key lama sebelum rotasi
 
     class Meta:
         db_table = 'ledger_sealer_keys'
@@ -293,11 +297,48 @@ class SealerKey(models.Model):
             return False
         return True
 
+    def was_valid_at(self, when):
+        """Apakah signature yang dibuat pada `when` masih sah.
 
-class SealerKeyAuditLog(models.Model):
-    """Audit log untuk sealer key operations (register, rotate, expire, revoke, usage).
+        Key yang di-rotate / expired tetap sah untuk blok yang ditandatangani SEBELUM key itu
+        dinonaktifkan (supaya rotasi tidak membatalkan riwayat). Key REVOKED (bocor) tidak
+        pernah sah lagi, termasuk untuk blok lama.
+        """
+        if self.status == self.KeyStatus.REVOKED:
+            return False
+        if self.valid_until and when > self.valid_until:
+            return False
+        return not (self.deactivated_at and when > self.deactivated_at)
+
+
+class AppendOnlyQuerySet(models.QuerySet):
+    def _forbid(self, *args, **kwargs):
+        raise LedgerWriteForbidden("Tabel ini append-only")
+
+    update = delete = bulk_update = update_or_create = _forbid
+
+
+class AppendOnlyModel(models.Model):
+    """Boleh INSERT, tidak boleh UPDATE / DELETE lewat ORM."""
+    objects = AppendOnlyQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise LedgerWriteForbidden(f"{type(self).__name__} append-only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise LedgerWriteForbidden(f"{type(self).__name__} append-only")
+
+
+class SealerKeyAuditLog(AppendOnlyModel):
+    """Audit log untuk sealer key operations (register, rotate, expire, revoke, usage, split, recover).
 
     Bukan bagian ledger (managed=True) - ini hanya untuk audit trail dan compliance.
+    Append-only: ditulis lewat ledger.services, tidak pernah diubah / dihapus lewat ORM.
     """
     class EventType(models.TextChoices):
         KEY_REGISTERED = 'key_registered', 'Key Registered'
@@ -305,6 +346,8 @@ class SealerKeyAuditLog(models.Model):
         KEY_EXPIRED = 'key_expired', 'Key Expired'
         KEY_REVOKED = 'key_revoked', 'Key Revoked'
         KEY_USED = 'key_used', 'Key Used'
+        KEY_SPLIT = 'key_split', 'Key Split (Shamir)'
+        KEY_RECOVERED = 'key_recovered', 'Key Recovered (Shamir)'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=50, choices=EventType.choices)
@@ -319,6 +362,7 @@ class SealerKeyAuditLog(models.Model):
     # Sealer info
     sealer_id = models.UUIDField(null=True, blank=True)
     sealer_name = models.CharField(max_length=100, null=True, blank=True)
+    region = models.CharField(max_length=64, blank=True, default="")
 
     # Key info
     old_key_id = models.UUIDField(null=True, blank=True)
@@ -346,3 +390,29 @@ class SealerKeyAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.event_type} - {self.sealer_name or 'Unknown'} at {self.timestamp}"
+
+
+class BlockSignature(AppendOnlyModel):
+    """Co-signature sebuah blok dari sealer lain (mis. region lain) SETELAH blok disegel.
+
+    ledger_blocks append-only, jadi signature tambahan disimpan di sini. Signature menandatangani
+    block_hash yang sama; verify_block_signatures() menggabungkan ini dengan Block.signatures.
+    """
+    id = models.BigAutoField(primary_key=True)
+    block = models.ForeignKey(Block, on_delete=models.DO_NOTHING, db_constraint=False,
+                              db_column='block_no', related_name='cosignatures')
+    sealer = models.ForeignKey(SealerKey, on_delete=models.PROTECT, related_name='cosignatures')
+    region = models.CharField(max_length=64, blank=True, default="")
+    public_key = models.CharField(max_length=64)
+    signature = models.CharField(max_length=128)
+    signed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ledger_block_signatures'
+        ordering = ['block_id', 'signed_at']
+        constraints = [
+            models.UniqueConstraint(fields=['block', 'sealer'], name='ledger_blocksig_unique'),
+        ]
+
+    def __str__(self):
+        return f"block #{self.block_id} by {self.sealer_id} ({self.region or '-'})"

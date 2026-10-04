@@ -7,16 +7,26 @@ Tes tidak memakai model tenant: ledger tidak punya FK ke sana, dan pengecekan ke
 diganti fungsi palsu di bawah lewat settings.LEDGER_MEMBER_CHECK.
 """
 import hashlib
+import itertools
+import os
 import time
 import uuid
 from datetime import timedelta
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import skipUnless
 
+from django.core.management import call_command
 from django.db import DatabaseError, connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import timezone as dj_timezone
+from nacl import signing as nacl_signing
 
 from . import services as svc
-from .models import Collection, Entry, Holding, Log, LedgerWriteForbidden
+from . import shamir
+from .models import (BlockSignature, Collection, Entry, Holding, LedgerWriteForbidden, Log, SealerKey,
+                     SealerKeyAuditLog)
 
 _MEMBERS = {}          # association_id -> {member_id, ...}
 
@@ -296,3 +306,229 @@ class SerialNoTests(LedgerTestCase):
         self.assertTrue(col.serial_no.isdigit())
         self.assertGreaterEqual(len(col.serial_no), 8)
 
+
+
+# ---------------------------------------------------------------- sealer keys
+Event = SealerKeyAuditLog.EventType
+
+
+@override_settings(LEDGER_MEMBER_CHECK=f"{__name__}.fake_member_check")
+class SealerKeyTestCase(TestCase):
+    def setUp(self):
+        _MEMBERS.clear()
+        self.assoc, self.member = uuid.uuid4(), uuid.uuid4()
+        _MEMBERS[self.assoc] = {self.member}
+
+    def _sealer(self, name, region=""):
+        private, public = svc.generate_sealer_keypair()
+        return svc.register_sealer(name, public, region=region), private
+
+    def _seal(self, keys=None):
+        """Buat entry, tunggu jendela 1 dtk lewat, segel semua blok. Return blok terakhir."""
+        svc.create_entry(self.assoc, self.member, "uji sealer", 1)
+        time.sleep(2.2)
+        last = None
+        while block := svc.seal_next_block(window=timedelta(seconds=1), safety_lag=timedelta(0),
+                                           sealer_private_keys=keys):
+            last = block
+        self.assertIsNotNone(last)
+        return last
+
+
+class SealerAuditLogTests(SealerKeyTestCase):
+    def test_register_rotate_revoke_and_expire_are_audited(self):
+        sealer, _ = self._sealer("sealer-1", region="ap-southeast-1")
+        _, new_public = svc.generate_sealer_keypair()
+        actor = {"user_id": "42", "email": "ops@example.com", "ip": "10.0.0.1"}
+        new_key = svc.rotate_sealer_key(sealer.id, new_public, reason="compromised", actor_info=actor)
+
+        rotated = SealerKeyAuditLog.objects.get(event_type=Event.KEY_ROTATED)
+        self.assertEqual((rotated.old_key_id, rotated.new_key_id), (sealer.id, new_key.id))
+        self.assertEqual((rotated.old_public_key, rotated.new_public_key), (sealer.public_key, new_public))
+        self.assertEqual(rotated.rotation_reason, "compromised")
+        self.assertEqual((rotated.actor_email, rotated.actor_ip), ("ops@example.com", "10.0.0.1"))
+        self.assertEqual(rotated.region, "ap-southeast-1")
+        sealer.refresh_from_db()
+        self.assertEqual(sealer.status, SealerKey.KeyStatus.EXPIRED)
+        self.assertIsNotNone(sealer.deactivated_at)
+        self.assertEqual((new_key.previous_key_id, new_key.region), (sealer.id, "ap-southeast-1"))
+        with self.assertRaises(svc.InvalidState):
+            svc.rotate_sealer_key(sealer.id, svc.generate_sealer_keypair()[1])
+
+        svc.revoke_sealer_key(new_key.id, reason="leaked")
+        self.assertTrue(SealerKeyAuditLog.objects.filter(event_type=Event.KEY_REVOKED,
+                                                         old_key_id=new_key.id,
+                                                         rotation_reason="leaked").exists())
+
+        old, _ = self._sealer("sealer-old")
+        SealerKey.objects.filter(pk=old.pk).update(valid_until=dj_timezone.now() - timedelta(days=1))
+        self.assertEqual(svc.expire_old_keys(), 1)
+        self.assertTrue(SealerKeyAuditLog.objects.filter(event_type=Event.KEY_EXPIRED,
+                                                         sealer_id=old.id).exists())
+        trail = list(svc.sealer_audit_trail(sealer_name="sealer-1").values_list("event_type", flat=True))
+        self.assertEqual(sorted(trail), sorted([Event.KEY_REGISTERED, Event.KEY_ROTATED, Event.KEY_REVOKED]))
+
+    def test_audit_log_is_append_only(self):
+        self._sealer("sealer-1")
+        log = SealerKeyAuditLog.objects.get()
+        log.rotation_reason = "diubah"
+        with self.assertRaises(LedgerWriteForbidden):
+            log.save()
+        with self.assertRaises(LedgerWriteForbidden):
+            log.delete()
+        with self.assertRaises(LedgerWriteForbidden):
+            SealerKeyAuditLog.objects.all().delete()
+        with self.assertRaises(LedgerWriteForbidden):
+            SealerKeyAuditLog.objects.update(rotation_reason="x")
+
+    def test_sealing_is_audited_and_rotation_keeps_history_valid(self):
+        sealer, private = self._sealer("sealer-1")
+        block = self._seal([{"sealer_id": sealer.id, "private_key": private}])
+        used = SealerKeyAuditLog.objects.filter(event_type=Event.KEY_USED, sealer_id=sealer.id)
+        self.assertTrue(used.filter(block_at_rotation=block.block_no).exists())
+
+        svc.rotate_sealer_key(sealer.id, svc.generate_sealer_keypair()[1])
+        rotated = SealerKeyAuditLog.objects.get(event_type=Event.KEY_ROTATED)
+        self.assertEqual(rotated.block_at_rotation, block.block_no)
+        self.assertEqual(svc.verify_blocks(), (True, None))       # blok lama tetap sah
+
+        svc.revoke_sealer_key(SealerKey.objects.get(previous_key=sealer).id)
+        self.assertEqual(svc.verify_blocks(), (True, None))       # revoke key BARU: blok lama aman
+        SealerKey.objects.filter(pk=sealer.pk).update(status=SealerKey.KeyStatus.REVOKED)
+        self.assertEqual(svc.verify_blocks()[0], False)           # key penanda blok bocor
+
+    def test_forged_and_duplicate_signatures_are_not_counted(self):
+        sealer, private = self._sealer("sealer-1")
+        block = self._seal([{"sealer_id": sealer.id, "private_key": private}])
+        sig = block.signatures[0]
+        self.assertEqual(svc.verify_block_signatures(block, threshold=1), (True, 1))
+        block.signatures = [sig, dict(sig)]                       # duplikat
+        self.assertEqual(svc.verify_block_signatures(block, threshold=2), (False, 1))
+        rogue_private, rogue_public = svc.generate_sealer_keypair()
+        rogue_sig = nacl_signing.SigningKey(bytes.fromhex(rogue_private)).sign(
+            bytes(block.block_hash)).signature.hex()
+        block.signatures = [sig, {"sealer_id": str(sealer.id), "public_key": rogue_public,
+                                  "signature": rogue_sig}]          # key tak terdaftar
+        self.assertEqual(svc.verify_block_signatures(block, threshold=2), (False, 1))
+
+
+class MultiRegionSealerTests(SealerKeyTestCase):
+    def test_cosign_from_second_region_satisfies_min_regions(self):
+        jkt, jkt_key = self._sealer("sealer-jkt", region="ap-southeast-3")
+        sgp, sgp_key = self._sealer("sealer-sgp", region="ap-southeast-1")
+        block = self._seal([{"sealer_id": jkt.id, "private_key": jkt_key}])
+        self.assertEqual(block.signatures[0]["region"], "ap-southeast-3")
+        self.assertEqual(svc.verify_blocks(threshold=2, min_regions=2), (False, 1))
+
+        self.assertEqual([b.block_no for b in svc.pending_cosign_blocks(jkt.id)], [])
+        self.assertIn(block.block_no, [b.block_no for b in svc.pending_cosign_blocks(sgp.id)])
+        for b in svc.pending_cosign_blocks(sgp.id):
+            svc.cosign_block(b.block_no, sgp.id, sgp_key)
+        self.assertEqual(list(svc.pending_cosign_blocks(sgp.id)), [])
+        self.assertEqual(svc.verify_blocks(threshold=2, min_regions=2), (True, None))
+        self.assertEqual({s.region for s in svc.valid_block_signers(block)},
+                         {"ap-southeast-1", "ap-southeast-3"})
+        self.assertTrue(SealerKeyAuditLog.objects.filter(
+            event_type=Event.KEY_USED, sealer_id=sgp.id, metadata__mode="cosign").exists())
+
+        with self.assertRaises(svc.InvalidState):
+            svc.cosign_block(block.block_no, sgp.id, sgp_key)    # dua kali
+        with self.assertRaises(svc.InvalidState):
+            svc.cosign_block(block.block_no, jkt.id, jkt_key)    # sudah menyegel
+        with self.assertRaises(svc.InvalidInput):
+            svc.cosign_block(block.block_no, sgp.id, jkt_key)    # key salah
+        with self.assertRaises(LedgerWriteForbidden):
+            BlockSignature.objects.all().delete()
+
+    def test_cosign_ledger_command(self):
+        jkt, jkt_key = self._sealer("sealer-jkt", region="ap-southeast-3")
+        sgp, sgp_key = self._sealer("sealer-sgp", region="ap-southeast-1")
+        self._seal([{"sealer_id": jkt.id, "private_key": jkt_key}])
+        out = StringIO()
+        with _env(SGP_KEY=sgp_key):
+            call_command("cosign_ledger", "--sealer-id", str(sgp.id), "--key-env", "SGP_KEY", "--once",
+                         stdout=out)
+        self.assertIn("region=ap-southeast-1", out.getvalue())
+        self.assertEqual(svc.verify_blocks(threshold=2, min_regions=2), (True, None))
+        self.assertEqual(svc.get_active_sealers(region="ap-southeast-1").get(), sgp)
+
+
+class _env:
+    def __init__(self, **values):
+        self.values, self.old = values, {}
+
+    def __enter__(self):
+        for k, v in self.values.items():
+            self.old[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class ShamirTests(SimpleTestCase):
+    def test_any_threshold_subset_recovers_secret(self):
+        secret = bytes(range(32))
+        shares = shamir.split_secret(secret, 5, 3)
+        for subset in itertools.permutations(shares, 3):
+            self.assertEqual(shamir.combine_shares(list(subset)), secret)
+        self.assertEqual(shamir.combine_shares(shares), secret)
+
+    def test_too_few_mixed_or_corrupt_shares_are_rejected(self):
+        a = shamir.split_secret(b"\x01" * 32, 3, 2)
+        b = shamir.split_secret(b"\x01" * 32, 3, 2)
+        with self.assertRaises(shamir.ShamirError):
+            shamir.combine_shares(a[:1])
+        with self.assertRaises(shamir.ShamirError):
+            shamir.combine_shares([a[0], b[1]])
+        corrupt = a[0][:-12] + ("0" if a[0][-12] != "0" else "1") + a[0][-11:]
+        with self.assertRaises(shamir.ShamirError):
+            shamir.combine_shares([corrupt, a[1]])
+        with self.assertRaises(shamir.ShamirError):
+            shamir.split_secret(b"x", 2, 3)
+
+
+class SealerShamirServiceTests(SealerKeyTestCase):
+    def test_split_and_recover_are_audited_without_leaking_secret(self):
+        sealer, private = self._sealer("sealer-1")
+        shares = svc.split_sealer_private_key(sealer.id, private, shares=5, threshold=3)
+        self.assertEqual(svc.recover_sealer_private_key(sealer.id, shares[1:4]), private)
+
+        split_log = SealerKeyAuditLog.objects.get(event_type=Event.KEY_SPLIT)
+        self.assertEqual((split_log.metadata["shares"], split_log.metadata["threshold"]), (5, 3))
+        self.assertEqual(len(split_log.metadata["share_fingerprints"]), 5)
+        self.assertTrue(SealerKeyAuditLog.objects.filter(event_type=Event.KEY_RECOVERED).exists())
+        dump = str(list(SealerKeyAuditLog.objects.values()))
+        self.assertNotIn(private, dump)
+        for share in shares:
+            self.assertNotIn(share, dump)
+
+        other, other_private = self._sealer("sealer-2")
+        with self.assertRaises(svc.InvalidInput):
+            svc.recover_sealer_private_key(other.id, shares[:3])  # share milik sealer lain
+        with self.assertRaises(svc.InvalidInput):
+            svc.recover_sealer_private_key(sealer.id, shares[:2])  # kurang dari threshold
+        with self.assertRaises(svc.InvalidInput):
+            svc.split_sealer_private_key(sealer.id, other_private, 3, 2)
+
+    def test_recovered_key_can_seal_and_command_roundtrip(self):
+        sealer, private = self._sealer("sealer-1")
+        with TemporaryDirectory() as tmp, _env(SEALER_KEY=private):
+            out = StringIO()
+            call_command("sealer_shamir", "split", "--sealer-id", str(sealer.id), "--key-env", "SEALER_KEY",
+                         "--shares", "3", "--threshold", "2", "--out-dir", tmp, stdout=out)
+            files = sorted(Path(tmp).iterdir())
+            self.assertEqual(len(files), 3)
+            self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+            out = StringIO()
+            call_command("sealer_shamir", "check", "--sealer-id", str(sealer.id),
+                         "--share-file", str(files[0]), "--share-file", str(files[2]), stdout=out)
+            self.assertIn("OK", out.getvalue())
+            shares = [files[1].read_text().strip(), files[2].read_text().strip()]
+        recovered = svc.recover_sealer_private_key(sealer.id, shares)
+        block = self._seal([{"sealer_id": sealer.id, "private_key": recovered}])
+        self.assertEqual(svc.verify_block_signatures(block), (True, 1))
