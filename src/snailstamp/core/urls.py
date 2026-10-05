@@ -24,4 +24,8 @@ urlpatterns = [
     path('api/<str:version>/', include('snailstamp.api.urls', namespace='api')),
     path('api/docs/', SpectacularSwaggerView.as_view(
         url='/api/v1/schema/', permission_classes=[AllowAny], authentication_classes=[]), name='api-docs'),
+    path('api/v1/auth/', include('dj_rest_auth.urls')),
+    path('api/v1/auth/registration/', include('dj_rest_auth.registration.urls')),
+    path('api/v1/auth/google/', include('allauth.socialaccount.providers.google.urls')),
+    path('accounts/', include('allauth.urls')),
 ]

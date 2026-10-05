@@ -54,6 +54,16 @@ INSTALLED_APPS = [
     'rest_framework',
     'drf_spectacular',
 
+    # django-allauth
+    'django.contrib.sites',
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    'allauth.socialaccount.providers.google',
+    'rest_framework.authtoken',
+    'dj_rest_auth',
+    'dj_rest_auth.registration',
+
     # admin last
     'django.contrib.admin',
 ]
@@ -64,6 +74,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -177,13 +188,20 @@ if USE_S3:
 
 MAILERS = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        'BACKEND': env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend'),
+        'HOST': env('EMAIL_HOST', default='localhost'),
+        'PORT': env.int('EMAIL_PORT', default=587),
+        'USE_TLS': env.bool('EMAIL_USE_TLS', default=True),
+        'USER': env('EMAIL_HOST_USER', default=''),
+        'PASSWORD': env('EMAIL_HOST_PASSWORD', default=''),
+        'DEFAULT_FROM_EMAIL': env('DEFAULT_FROM_EMAIL', default='noreply@snailstamp.com'),
     },
 }
 
 AUTH_USER_MODEL='tenant.User'
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend',
+    'allauth.account.auth_backends.AuthenticationBackend',
     'guardian.backends.ObjectPermissionBackend'
 )
 
@@ -211,6 +229,41 @@ SPECTACULAR_SETTINGS = {
     "DESCRIPTION": "Versioned REST API for SnailStamp associations and the tamper-evident item ledger.",
     "VERSION": "v1",
     "SERVE_INCLUDE_SCHEMA": False,
+}
+
+# django-allauth configuration
+SITE_ID = 1
+
+ACCOUNT_LOGIN_METHODS = {'email'}
+ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
+ACCOUNT_UNIQUE_EMAIL = True
+ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', default='mandatory')
+ACCOUNT_CONFIRM_EMAIL_ON_GET = False
+ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
+ACCOUNT_LOGOUT_ON_PASSWORD_CHANGE = False
+
+ACCOUNT_EMAIL_SUBJECT_PREFIX = '[SnailStamp] '
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
+
+ACCOUNT_ADAPTER = 'snailstamp.apps.tenant.adapters.AccountAdapter'
+SOCIALACCOUNT_ADAPTER = 'snailstamp.apps.tenant.adapters.SocialAccountAdapter'
+
+# Social account settings
+SOCIALACCOUNT_EMAIL_VERIFICATION = env('SOCIALACCOUNT_EMAIL_VERIFICATION', default='none')
+SOCIALACCOUNT_EMAIL_REQUIRED = True
+SOCIALACCOUNT_QUERY_EMAIL = True
+
+# Google OAuth settings
+SOCIALACCOUNT_PROVIDERS = {
+    'google': {
+        'SCOPE': [
+            'profile',
+            'email',
+        ],
+        'AUTH_PARAMS': {
+            'access_type': 'online',
+        },
+    }
 }
 
 # Ledger integrity (lihat BLOCK_SIGNING.md)
