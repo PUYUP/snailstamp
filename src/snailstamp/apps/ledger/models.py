@@ -441,4 +441,31 @@ class BlockAnchor(AppendOnlyModel):
     def __str__(self):
         return f"anchor block #{self.block_no} -> {self.backend}"
 
+
+class QueuedTransaction(models.Model):
+    """Optional async command queue; independent from the append-only ledger tables."""
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SUCCEEDED = "succeeded", "Succeeded"
+        FAILED = "failed", "Failed"
+
+    id = models.BigAutoField(primary_key=True)
+    association_id = models.UUIDField(db_index=True)
+    member_id = models.UUIDField()
+    operation = models.CharField(max_length=32)
+    payload = models.JSONField()
+    priority = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    result = models.JSONField(null=True, blank=True)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "ledger_queued_transactions"
+        indexes = [
+            models.Index(fields=["status", "-priority", "created_at"], name="ledger_queue_order_idx"),
+            models.Index(fields=["association_id", "created_at"], name="ledger_queue_rate_idx"),
+        ]
+
 from .assets import Asset  # noqa: F401  (daftarkan model Asset ke app ledger)

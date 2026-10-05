@@ -82,6 +82,19 @@ VALUES (7, 12, 11, 1);                                            -- pensil meng
 * Reset **development**: `sql/dev_reset.sql` (lihat petunjuk di dalamnya). Migrasi skema sengaja tidak
   bisa di-reverse: ledger production tidak boleh di-rollback.
 
+## Antrean transaksi (opsional)
+Alur `ledger.services` tetap sinkron seperti semula. Untuk mengantrekan operasi dari API, panggil
+`ledger.transaction_queue.enqueue(operation, association_id, member_id, priority=..., **payload)`;
+operasi yang didukung: `send`, `claim_transfer`, `cancel_send`, `assign`, `use`, dan `act`.
+Prioritas 0–100; angka lebih besar dikerjakan lebih dulu, lalu FIFO. Migrasikan database agar tabel
+antrean dibuat, lalu jalankan worker: `python manage.py process_ledger_queue --batch-size 100`.
+Gunakan `--sleep 0` untuk satu batch. Beberapa worker PostgreSQL dapat berjalan bersamaan.
+
+Rate limit bawaan adalah 60 enqueue per association per 60 detik, dapat diubah dengan
+`LEDGER_QUEUE_RATE_LIMIT` dan `LEDGER_QUEUE_RATE_PERIOD_SECONDS`; limit 0 mematikan pembatasan.
+Kegagalan operasi ditandai `failed` dan tidak otomatis dicoba ulang, agar operasi ledger tidak
+terduplikasi. Queue hanya mencatat payload operasional; jangan masukkan konten rahasia.
+
 ## Batas yang disengaja
 * `verify_chain` memeriksa struktur, state, penghitung, tautan silang (termasuk member di kedua sisi),
   dan bahwa MINT dilakukan association penerbit entry. Ia TIDAK memeriksa ulang registry (aturan boleh

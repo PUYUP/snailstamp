@@ -238,3 +238,8 @@ if env('LEDGER_WITNESS_FILE', default=''):
         'BACKEND': 'snailstamp.apps.ledger.anchors.FileAnchorBackend',
         'OPTIONS': {'path': env('LEDGER_WITNESS_FILE')},
     })
+
+# Optional transaction queue. Limit counts enqueues by association over a rolling window;
+# set limit to 0 to disable throttling. Existing synchronous services are unaffected.
+LEDGER_QUEUE_RATE_LIMIT = env.int('LEDGER_QUEUE_RATE_LIMIT', default=60)
+LEDGER_QUEUE_RATE_PERIOD_SECONDS = env.int('LEDGER_QUEUE_RATE_PERIOD_SECONDS', default=60)
