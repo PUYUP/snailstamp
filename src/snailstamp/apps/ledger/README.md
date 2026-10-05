@@ -81,14 +81,22 @@ VALUES (7, 12, 11, 1);                                            -- pensil meng
   deteksi penulisan ulang member, sealer + bukti Merkle. Tidak butuh data tenant.
 * Reset **development**: `sql/dev_reset.sql` (lihat petunjuk di dalamnya). Migrasi skema sengaja tidak
   bisa di-reverse: ledger production tidak boleh di-rollback.
+* Bila `migrate` berhenti dengan `DuplicateTable: relation "ledger_entry_id_seq" already exists`,
+  jalankan ulang migrasi setelah update terbaru. `0001_schema.sql` sekarang toleran terhadap sequence
+  dan fungsi dev yang tertinggal. Jika error berikutnya menyebut tabel/trigger ledger lain sudah ada, berarti schema
+  ledger sudah dibuat sebagian; untuk database development gunakan `sql/dev_reset.sql`, lalu migrasi lagi.
 
 ## Antrean transaksi (opsional)
 Alur `ledger.services` tetap sinkron seperti semula. Untuk mengantrekan operasi dari API, panggil
 `ledger.transaction_queue.enqueue(operation, association_id, member_id, priority=..., **payload)`;
 operasi yang didukung: `send`, `claim_transfer`, `cancel_send`, `assign`, `use`, dan `act`.
 Prioritas 0–100; angka lebih besar dikerjakan lebih dulu, lalu FIFO. Migrasikan database agar tabel
-antrean dibuat, lalu jalankan worker: `python manage.py process_ledger_queue --batch-size 100`.
-Gunakan `--sleep 0` untuk satu batch. Beberapa worker PostgreSQL dapat berjalan bersamaan.
+antrean dibuat. Set `REDIS_URL` (default `redis://localhost:6379/0`), lalu jalankan Celery worker dan
+beat: `celery -A snailstamp worker -l info` dan `celery -A snailstamp beat -l info`. Worker memproses
+batch hingga `LEDGER_QUEUE_BATCH_SIZE` (default 100); beat menyapu queue tiap 5 detik sebagai
+pemulihan bila Redis sempat tidak tersedia setelah transaksi DB tersimpan. `process_ledger_queue`
+tetap tersedia sebagai worker polling manual/fallback. Beberapa worker PostgreSQL dapat berjalan
+bersamaan.
 
 Rate limit bawaan adalah 60 enqueue per association per 60 detik, dapat diubah dengan
 `LEDGER_QUEUE_RATE_LIMIT` dan `LEDGER_QUEUE_RATE_PERIOD_SECONDS`; limit 0 mematikan pembatasan.

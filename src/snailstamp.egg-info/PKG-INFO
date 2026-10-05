@@ -6,6 +6,7 @@ Author-email: Your Name <your.email@example.com>
 Requires-Python: >=3.10
 Requires-Dist: Django>=6.1
 Requires-Dist: djangorestframework>=3.15
+Requires-Dist: djangorestframework-simplejwt>=5.3
 Requires-Dist: django-allauth>=65.0
 Requires-Dist: django-environ>=0.11
 Requires-Dist: psycopg[binary,pool]>=3.3

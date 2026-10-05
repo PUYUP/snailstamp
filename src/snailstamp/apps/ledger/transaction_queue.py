@@ -14,6 +14,7 @@ from . import services
 from .models import QueuedTransaction
 
 _OPERATIONS = {
+    "create_item": {"reason", "quantity", "kind_code", "metadata", "prefix"},
     "send": {"collection_id", "payload"},
     "claim_transfer": {"token"},
     "cancel_send": {"collection_id"},
@@ -22,6 +23,7 @@ _OPERATIONS = {
     "act": {"action_code", "tool_id", "target_id", "content", "content_hash", "payload"},
 }
 _REQUIRED = {
+    "create_item": {"reason", "quantity", "kind_code"},
     "send": {"collection_id"}, "claim_transfer": {"token"},
     "cancel_send": {"collection_id"}, "assign": {"collection_id"},
     "use": {"collection_id"}, "act": {"action_code", "tool_id", "target_id"},
@@ -54,6 +56,12 @@ def _restore(value):
     return value
 
 
+def _dispatch_queue_task():
+    # Import lazily so the synchronous ledger API does not require a running broker.
+    from .tasks import process_queue_batch
+    process_queue_batch.delay()
+
+
 def enqueue(operation, association_id, member_id, *, priority=0, **payload):
     """Validate and queue an operation; priority is 0..100, with larger values first."""
     if operation not in _OPERATIONS:
@@ -80,15 +88,23 @@ def enqueue(operation, association_id, member_id, *, priority=0, **payload):
                                                    created_at__gte=since).count()
         if limit > 0 and recent >= limit:
             raise QueueRateLimited("batas transaksi per association terlampaui")
-        return QueuedTransaction.objects.create(
+        queued = QueuedTransaction.objects.create(
             association_id=association_id, member_id=member_id,
             operation=operation, payload=_json_safe(payload), priority=priority,
         )
+        # Only publish after the DB commit: a worker must never receive an uncommitted row.
+        # robust=True leaves the durable DB queue intact if Redis is temporarily unavailable;
+        # Celery Beat's recovery sweep will pick it up later.
+        transaction.on_commit(_dispatch_queue_task, robust=True)
+        return queued
 
 
 def _execute(item):
     common = (item.association_id, item.member_id)
     p = _restore(item.payload)
+    if item.operation == "create_item":
+        return services.create_item(*common, p["reason"], p["quantity"], p["kind_code"],
+                                    metadata=p.get("metadata"), prefix=p.get("prefix", ""))
     if item.operation == "send":
         return services.send(p["collection_id"], *common, payload=p.get("payload"))
     if item.operation == "claim_transfer":

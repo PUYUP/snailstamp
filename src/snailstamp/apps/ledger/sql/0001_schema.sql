@@ -63,18 +63,18 @@
 -- 0. Sequence ID
 --    Multi-node nanti:  INCREMENT BY <jumlah_node> START <nomor_node>
 -- ---------------------------------------------------------------------
-CREATE SEQUENCE ledger_entry_id_seq      AS bigint;
-CREATE SEQUENCE ledger_collection_id_seq AS bigint CACHE 1000;
+CREATE SEQUENCE IF NOT EXISTS ledger_entry_id_seq      AS bigint;
+CREATE SEQUENCE IF NOT EXISTS ledger_collection_id_seq AS bigint CACHE 1000;
 
 -- ---------------------------------------------------------------------
 -- 1. Fungsi hash (deterministik, bisa direplikasi di Python/verifier luar)
 -- ---------------------------------------------------------------------
-CREATE FUNCTION ledger_micros(ts timestamptz) RETURNS bigint
+CREATE OR REPLACE FUNCTION ledger_micros(ts timestamptz) RETURNS bigint
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT floor(extract(epoch FROM ts) * 1000000)::bigint $$;
 
 -- hash entry = sidik jari "alasan" -> menjadi benih semua chain di bawahnya
-CREATE FUNCTION ledger_entry_hash(p_id bigint, p_issuer uuid, p_issuer_member uuid, p_reason text,
+CREATE OR REPLACE FUNCTION ledger_entry_hash(p_id bigint, p_issuer uuid, p_issuer_member uuid, p_reason text,
                                   p_supply int, p_kind smallint, p_metadata jsonb, p_ts timestamptz)
 RETURNS bytea LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT sha256(convert_to(
@@ -83,13 +83,13 @@ $$ SELECT sha256(convert_to(
        'UTF8')) $$;
 
 -- hash "sebelum log #1" suatu collection
-CREATE FUNCTION ledger_genesis_hash(p_entry_hash bytea, p_collection_id bigint, p_serial varchar)
+CREATE OR REPLACE FUNCTION ledger_genesis_hash(p_entry_hash bytea, p_collection_id bigint, p_serial varchar)
 RETURNS bytea LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $$ SELECT sha256(p_entry_hash ||
        convert_to(p_collection_id::text || '|' || p_serial::text, 'UTF8')) $$;
 
 -- hash log ke-n = sha256(hash log ke-(n-1) || isi log ke-n)
-CREATE FUNCTION ledger_log_hash(p_prev bytea, p_collection_id bigint, p_seq int,
+CREATE OR REPLACE FUNCTION ledger_log_hash(p_prev bytea, p_collection_id bigint, p_seq int,
                                 p_event smallint, p_actor uuid, p_actor_member uuid, p_counterparty uuid,
                                 p_ts timestamptz, p_payload jsonb,
                                 p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,
@@ -254,7 +254,7 @@ CREATE TABLE ledger_blocks (
 -- 8. PARTISI.  Jumlah partisi TIDAK bisa diubah mudah -> tentukan di awal.
 --    64 untuk satu node; skala triliun => shard ke banyak node (lihat catatan).
 -- ---------------------------------------------------------------------
-CREATE FUNCTION ledger_make_partitions(p_parent text, p_modulus int, p_opts text DEFAULT '')
+CREATE OR REPLACE FUNCTION ledger_make_partitions(p_parent text, p_modulus int, p_opts text DEFAULT '')
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
   FOR i IN 0 .. p_modulus - 1 LOOP
@@ -297,7 +297,7 @@ CREATE INDEX ledger_transfer_tokens_collection_idx ON ledger_transfer_tokens (co
 -- 10. IMMUTABILITY (trigger row-level hanya "menyala" bila ada yang mencoba
 --     UPDATE/DELETE -> biaya nol di jalur INSERT normal)
 -- ---------------------------------------------------------------------
-CREATE FUNCTION ledger_forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION ledger_forbid_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '% pada % dilarang (append-only)', TG_OP, TG_TABLE_NAME USING ERRCODE = 'LG005';
 END $$;
@@ -352,7 +352,7 @@ CREATE TRIGGER ledger_entries_frozen BEFORE UPDATE ON ledger_entries
 
 -- Association DAN member wajib ada. Tanpa ini NULL lolos diam-diam di perbandingan
 -- (NULL <> x = NULL) lalu gagal dengan galat NOT NULL yang membingungkan.
-CREATE FUNCTION ledger_require_actor(p_association uuid, p_member uuid) RETURNS void
+CREATE OR REPLACE FUNCTION ledger_require_actor(p_association uuid, p_member uuid) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
   IF p_association IS NULL OR p_member IS NULL THEN
@@ -362,7 +362,7 @@ END $$;
 
 -- internal: generate JSON snapshot dari Collection state (untuk rekonstruksi)
 -- plpgsql (bukan sql) supaya ledger_assets (dibuat di migrasi 0004) tidak divalidasi saat CREATE.
-CREATE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb
+CREATE OR REPLACE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb
 LANGUAGE plpgsql STABLE AS $$
 BEGIN
 RETURN jsonb_build_object(
@@ -400,7 +400,7 @@ RETURN jsonb_build_object(
 END $$;
 
 -- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.
-CREATE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
+CREATE OR REPLACE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
                                  p_counterparty uuid, p_payload jsonb, p_ts timestamptz,
                                  p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,
                                  p_action_id smallint DEFAULT NULL, p_content_hash bytea DEFAULT NULL,
@@ -422,7 +422,7 @@ BEGIN
 END $$;
 
 -- ENTRY: catat alasan + total supply. Item belum ada sampai di-mint.
-CREATE FUNCTION ledger_create_entry(p_issuer uuid, p_issuer_member uuid, p_reason text, p_supply int,
+CREATE OR REPLACE FUNCTION ledger_create_entry(p_issuer uuid, p_issuer_member uuid, p_reason text, p_supply int,
                                     p_metadata jsonb DEFAULT '{}', p_kind smallint DEFAULT 0)
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_id bigint := nextval('ledger_entry_id_seq'); v_now timestamptz := clock_timestamp();
@@ -452,7 +452,7 @@ END $$;
 -- MINT: lahirkan item berikutnya (serial minted_count+1 ...). Panggil berulang
 -- (mis. batch 10.000) sampai minted_count = supply. Mengembalikan jumlah yang dibuat.
 -- Item + log #1 + holdings dibuat dalam SATU statement.
-CREATE FUNCTION ledger_mint_batch(p_entry_id bigint, p_issuer uuid, p_issuer_member uuid, p_batch int, p_prefix varchar DEFAULT '')
+CREATE OR REPLACE FUNCTION ledger_mint_batch(p_entry_id bigint, p_issuer uuid, p_issuer_member uuid, p_batch int, p_prefix varchar DEFAULT '')
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE e ledger_entries; v_from int; v_to int; v_now timestamptz := clock_timestamp();
 BEGIN
@@ -501,7 +501,7 @@ BEGIN
 END $$;
 
 -- SEND: pemilik mengirim -> tanpa penerima. Kembalikan (seq, token UUID)
-CREATE FUNCTION ledger_send(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
+CREATE OR REPLACE FUNCTION ledger_send(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
                             p_payload jsonb DEFAULT NULL,
                             OUT new_seq int, OUT transfer_token uuid)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
@@ -529,7 +529,7 @@ BEGIN
 END $$;
 
 -- CLAIM TRANSFER (Penerima): penerima mendapat item dari scan QR
-CREATE FUNCTION ledger_claim_transfer(p_token uuid, p_actor uuid, p_actor_member uuid)
+CREATE OR REPLACE FUNCTION ledger_claim_transfer(p_token uuid, p_actor uuid, p_actor_member uuid)
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   t ledger_transfer_tokens; c ledger_collections; w record; v_now timestamptz := clock_timestamp();
@@ -566,7 +566,7 @@ BEGIN
 END $$;
 
 -- CANCEL (oleh pengirim): batalkan pengiriman tertunda.
-CREATE FUNCTION ledger_cancel_send(p_collection_id bigint, p_actor uuid, p_actor_member uuid)
+CREATE OR REPLACE FUNCTION ledger_cancel_send(p_collection_id bigint, p_actor uuid, p_actor_member uuid)
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; w record; v_now timestamptz := clock_timestamp();
 BEGIN
@@ -596,7 +596,7 @@ END $$;
 -- actor_id        = association pemilik (= owner_id)
 -- actor_member_id = member yang mengassign (misalnya admin keluarga)
 -- p_new_holder    = member penerima; NULL = lepas dari pemegang
-CREATE FUNCTION ledger_assign(
+CREATE OR REPLACE FUNCTION ledger_assign(
   p_collection_id bigint,
   p_actor         uuid,
   p_actor_member  uuid,
@@ -642,7 +642,7 @@ END $$;
 -- USE: aksi TUNGGAL oleh pemilik SAAT INI (mis. membaca surat, memakai stiker).
 -- p_action opsional (kata kerja dari registry). Menghitung sebagai "pemakaian alat"
 -- sehingga tunduk pada kinds.max_as_tool. Aksi antar-dua-item memakai ledger_act().
-CREATE FUNCTION ledger_use(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
+CREATE OR REPLACE FUNCTION ledger_use(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
                            p_action smallint DEFAULT NULL, p_payload jsonb DEFAULT NULL)
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE c ledger_collections; k ledger_kinds; w record; v_now timestamptz := clock_timestamp();
@@ -678,7 +678,7 @@ END $$;
 --     | 3 aktif (siapa pun)
 --   * kapasitas: kinds.max_as_tool (alat) dan kinds.max_as_target (sasaran)
 -- Atomik, DUA chain; dua baris dikunci dengan urutan id tetap -> tanpa deadlock.
-CREATE FUNCTION ledger_act(p_action smallint, p_tool bigint, p_target bigint, p_actor uuid, p_actor_member uuid,
+CREATE OR REPLACE FUNCTION ledger_act(p_action smallint, p_tool bigint, p_target bigint, p_actor uuid, p_actor_member uuid,
                            p_content_hash bytea DEFAULT NULL, p_payload jsonb DEFAULT NULL)
 RETURNS TABLE (tool_log_seq int, target_log_seq int)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
@@ -754,7 +754,7 @@ END $$;
 -- 12. VERIFIKASI: hitung ulang seluruh chain + replay state machine
 --     dan bandingkan dengan baris collections.
 -- ---------------------------------------------------------------------
-CREATE FUNCTION ledger_verify_chain(p_collection_id bigint)
+CREATE OR REPLACE FUNCTION ledger_verify_chain(p_collection_id bigint)
 RETURNS TABLE (valid boolean, broken_at_seq int, detail text)
 LANGUAGE plpgsql STABLE AS $$
 DECLARE

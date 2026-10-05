@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     # third party (depends on auth)
     'guardian',
     'organizations',
+    'rest_framework',
     'drf_spectacular',
 
     # admin last
@@ -195,12 +196,19 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
+    "DEFAULT_VERSION": "v1",
+    "ALLOWED_VERSIONS": ("v1",),
+    "VERSION_PARAM": "version",
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 50,
+    "EXCEPTION_HANDLER": "snailstamp.api.exceptions.exception_handler",
 }
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "SnailStamp API",
-    "DESCRIPTION": "Enterprise-grade Django Project",
-    "VERSION": "1.0.0",
+    "DESCRIPTION": "Versioned REST API for SnailStamp associations and the tamper-evident item ledger.",
+    "VERSION": "v1",
     "SERVE_INCLUDE_SCHEMA": False,
 }
 
@@ -243,3 +251,28 @@ if env('LEDGER_WITNESS_FILE', default=''):
 # set limit to 0 to disable throttling. Existing synchronous services are unaffected.
 LEDGER_QUEUE_RATE_LIMIT = env.int('LEDGER_QUEUE_RATE_LIMIT', default=60)
 LEDGER_QUEUE_RATE_PERIOD_SECONDS = env.int('LEDGER_QUEUE_RATE_PERIOD_SECONDS', default=60)
+LEDGER_QUEUE_BATCH_SIZE = env.int('LEDGER_QUEUE_BATCH_SIZE', default=100)
+LEDGER_MEMBER_CHECK = 'snailstamp.apps.tenant.ledger_authz.member_can_act'
+
+# Celery uses Redis for delivery/wakeup; queued transaction payloads remain in PostgreSQL.
+CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_TASK_DEFAULT_QUEUE = 'ledger_transactions'
+CELERY_TASK_DEFAULT_EXCHANGE = 'ledger_transactions'
+CELERY_TASK_DEFAULT_ROUTING_KEY = 'ledger_transactions'
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_IGNORE_RESULT = True
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_DEFAULT_DELIVERY_MODE = 'persistent'
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 3600}
+
+# Recovery sweep covers a broker outage between the DB commit and task publication.
+CELERY_BEAT_SCHEDULE = {
+    'ledger-queue-recovery-sweep': {
+        'task': 'snailstamp.ledger.process_queue_batch',
+        'schedule': 5.0,
+    },
+}
