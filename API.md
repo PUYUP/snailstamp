@@ -12,17 +12,22 @@ Endpoints live with their Django domain app: ledger resources are implemented un
 
 ## Authentication
 
-Protected endpoints require a JWT bearer token. Obtain a token pair:
+SnailStamp supports multiple authentication methods including email/password, Google OAuth, and JWT tokens. See [AUTHENTICATION.md](AUTHENTICATION.md) for detailed setup and usage.
+
+Protected endpoints require a JWT bearer token. The simplest way to obtain a token is via email/password login:
 
 ```http
-POST /api/v1/auth/token/
+POST /api/v1/auth/login/
 Content-Type: application/json
 
-{"username": "your-username", "password": "your-password"}
+{"email": "your-email@example.com", "password": "your-password"}
 ```
 
-Use the returned `access` token in `Authorization: Bearer <access>`. Refresh an expired
-access token with `POST /api/v1/auth/token/refresh/` and `{"refresh": "<refresh-token>"}`.
+Response includes a JWT token that can be used in the `Authorization: Bearer <token>` header.
+
+For social login with Google OAuth, or to set up email verification, refer to [AUTHENTICATION.md](AUTHENTICATION.md).
+
+Refresh an expired access token with `POST /api/v1/auth/token/refresh/` and `{"refresh": "<refresh-token>"}`.
 The access token is required on association, registry, item, history, and transaction routes.
 
 ## API reference
@@ -35,10 +40,19 @@ version is included in the generated document.
 
 ## Endpoints
 
+### Authentication
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/auth/token/` | Obtain JWT access and refresh tokens |
+| `POST` | `/api/v1/auth/registration/` | Register new user with email/password |
+| `POST` | `/api/v1/auth/login/` | Login with email/password and get JWT token |
+| `POST` | `/api/v1/auth/logout/` | Logout and invalidate token |
+| `POST` | `/api/v1/auth/google/` | Login with Google OAuth token |
+| `GET` | `/api/v1/auth/user/` | Get current user information |
 | `POST` | `/api/v1/auth/token/refresh/` | Refresh an access token |
+
+### Ledger & Associations
+| Method | Path | Purpose |
+|---|---|---|
 | `GET` | `/api/v1/me/associations/` | List the signed-in user's active association memberships |
 | `GET` | `/api/v1/ledger/kinds/` | List registered item kinds |
 | `GET` | `/api/v1/ledger/actions/` | List registered actions |
