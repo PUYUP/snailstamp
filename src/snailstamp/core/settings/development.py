@@ -3,14 +3,14 @@ from .base import *
 
 env = environ.Env(
     # set casting, default value
-    DEBUG=(bool, False)
+    DEBUG=(bool, True)
 )
 
 # Django
 DEBUG=env('DJANGO_DEBUG')
 ALLOWED_HOSTS=env('DJANGO_ALLOWED_HOSTS').split(',')
 SECRET_KEY=env('DJANGO_SECRET_KEY')
-PG_DATABASE_URL = env("PG_DATABASE_URL", default="")
+DATABASE_URL = env("DATABASE_URL", default="")
 
 # Vault
 CERTIFICATE_ENCRYPTION_KEY=env('CERTIFICATE_ENCRYPTION_KEY')
@@ -20,7 +20,7 @@ CERTIFICATE_ENCRYPTION_KEY=env('CERTIFICATE_ENCRYPTION_KEY')
 
 DATABASES = {
     "default": dj_database_url.config(
-        default=PG_DATABASE_URL,
+        default=DATABASE_URL,
         conn_max_age=600,
     )
 }
