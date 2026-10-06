@@ -20,6 +20,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
     dependencies = [
         ('ledger', '0003_state'),
+        ('tenant', '0001_initial'),
     ]
 
     operations = [

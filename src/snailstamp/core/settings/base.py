@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     # local apps FIRST (tenant must be before auth)
+    'snailstamp.apps.users',
     'snailstamp.apps.tenant',
     'snailstamp.apps.ledger',
 
@@ -198,7 +199,7 @@ MAILERS = {
     },
 }
 
-AUTH_USER_MODEL='tenant.User'
+AUTH_USER_MODEL='users.User'
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',
@@ -225,7 +226,7 @@ REST_FRAMEWORK = {
 }
 
 SPECTACULAR_SETTINGS = {
-    "TITLE": "SnailStamp API",
+    "TITLE": "Snail Stamp API",
     "DESCRIPTION": "Versioned REST API for SnailStamp associations and the tamper-evident item ledger.",
     "VERSION": "v1",
     "SERVE_INCLUDE_SCHEMA": False,
@@ -233,10 +234,14 @@ SPECTACULAR_SETTINGS = {
 
 # django-allauth configuration
 SITE_ID = 1
+HEADLESS_ONLY = True
 
 ACCOUNT_LOGIN_METHODS = {'email'}
-ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
+# username without (*) means optional
+ACCOUNT_SIGNUP_FIELDS = ['email*', 'username', 'password1*', 'password2*']
 ACCOUNT_UNIQUE_EMAIL = True
+ACCOUNT_EMAIL_VERIFICATION_BY_CODE_ENABLED = True
+ACCOUNT_EMAIL_CONFIRMATION_HMAC = False
 ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', default='mandatory')
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
@@ -264,6 +269,11 @@ SOCIALACCOUNT_PROVIDERS = {
             'access_type': 'online',
         },
     }
+}
+
+# Djanto rest auth (dj-rest-auth)
+REST_AUTH = {
+    'USE_JWT': True,
 }
 
 # Ledger integrity (lihat BLOCK_SIGNING.md)
