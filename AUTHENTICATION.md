@@ -257,3 +257,10 @@ For development with console email backend, the verification link will be printe
 - Verify `ACCOUNT_EMAIL_VERIFICATION` setting
 - Ensure custom adapters are configured in settings
 - Check Django logs for detailed error messages
+
+### SignUp with passkey
+
+- [POST] http://localhost:8000/api/allauth/app/v1/auth/webauthn/signup - start email validation, user will receive 8 validation code (must place X-Session-Token in header)
+- [POST] http://localhost:8000/api/allauth/app/v1/auth/email/verify - verify email with validation code (must place X-Session-Token in header, from prev step)
+- [GET] http://localhost:8000/api/allauth/app/v1/auth/webauthn/signup - generate passkey use webauth method (must place X-Session-Token in header, from prev step)
+- [PUT] http://localhost:8000/api/allauth/app/v1/auth/webauthn/signup - create access token (must place X-Session-Token in header, from prev step)

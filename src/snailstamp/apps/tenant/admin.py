@@ -15,6 +15,7 @@ class OwnerInline(admin.StackedInline):
 
 class AssociationAdmin(admin.ModelAdmin):
     model = Association
+    view_on_site = False
     # inlines = [OwnerInline]
 
 

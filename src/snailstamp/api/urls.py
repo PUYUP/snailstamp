@@ -8,8 +8,8 @@ from . import schema  # noqa: F401  (register the SimpleJWT OpenAPI auth scheme)
 app_name = "api"
 
 urlpatterns = [
-    path("schema/", SpectacularAPIView.as_view(permission_classes=[AllowAny], authentication_classes=[]),
-         name="schema"),
-    path("", include("snailstamp.apps.tenant.api.urls")),
-    path("", include("snailstamp.apps.ledger.api.urls")),
+    path("schema/", SpectacularAPIView.as_view(permission_classes=[AllowAny], authentication_classes=[]), name="schema"),
+    path("tenant/", include("snailstamp.apps.tenant.api.urls")),
+    path("ledger/", include("snailstamp.apps.ledger.api.urls")),
+    path("users/", include("snailstamp.apps.users.api.urls")),
 ]

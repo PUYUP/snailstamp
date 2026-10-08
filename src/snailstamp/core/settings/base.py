@@ -36,6 +36,7 @@ ALLOWED_HOSTS = []
 # Application definition
 
 INSTALLED_APPS = [
+    'django.contrib.sites',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
@@ -50,17 +51,22 @@ INSTALLED_APPS = [
     'django.contrib.auth',
 
     # third party (depends on auth)
+    'corsheaders',
     'guardian',
     'organizations',
     'rest_framework',
     'drf_spectacular',
 
     # django-allauth
-    'django.contrib.sites',
     'allauth',
     'allauth.account',
+    'allauth.headless',
+    'allauth.mfa',
+    'allauth.usersessions',
     'allauth.socialaccount',
     'allauth.socialaccount.providers.google',
+
+    # rest framework
     'rest_framework.authtoken',
     'dj_rest_auth',
     'dj_rest_auth.registration',
@@ -72,6 +78,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -210,7 +217,7 @@ AUTHENTICATION_BACKENDS = (
 # DRF
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "allauth.headless.contrib.rest_framework.authentication.JWTTokenAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
@@ -235,14 +242,17 @@ SPECTACULAR_SETTINGS = {
 # django-allauth configuration
 SITE_ID = 1
 HEADLESS_ONLY = True
+HEADLESS_SERVE_SPECIFICATION = True
 
 ACCOUNT_LOGIN_METHODS = {'email'}
 # username without (*) means optional
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'username', 'password1*', 'password2*']
 ACCOUNT_UNIQUE_EMAIL = True
+ACCOUNT_EMAIL_CONFIRMATION_HMAC = True
+ACCOUNT_LOGIN_BY_CODE_ENABLED = True
 ACCOUNT_EMAIL_VERIFICATION_BY_CODE_ENABLED = True
-ACCOUNT_EMAIL_CONFIRMATION_HMAC = False
-ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', default='mandatory')
+ACCOUNT_EMAIL_VERIFICATION_SUPPORTS_RESEND = True
+ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', default='none')
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 ACCOUNT_LOGOUT_ON_PASSWORD_CHANGE = False
@@ -252,6 +262,24 @@ ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
 
 ACCOUNT_ADAPTER = 'snailstamp.apps.tenant.adapters.AccountAdapter'
 SOCIALACCOUNT_ADAPTER = 'snailstamp.apps.tenant.adapters.SocialAccountAdapter'
+
+MFA_SUPPORTED_TYPES = ["totp", "recovery_codes", "webauthn"]
+MFA_PASSKEY_LOGIN_ENABLED = True
+MFA_PASSKEY_SIGNUP_ENABLED = True
+
+HEADLESS_FRONTEND_URLS = {
+    "account_signup": "https://app.snailstamp.com/account/signup",
+    "account_reset_password": "https://app.snailstamp.com/account/password/reset",
+    "account_reset_password_from_key": "https://app.snailstamp.com/account/password/reset/key/{key}",
+    "account_confirm_email": "https://app.snailstamp.com/account/verify-email/{key}",
+    "socialaccount_login_error": "https://app.snailstamp.com/account/provider/callback",
+}
+
+# Security: Allow HS256 for headless tokens
+HEADLESS_TOKEN_STRATEGY = "allauth.headless.tokens.strategies.jwt.JWTTokenStrategy"
+HEADLESS_JWT_ALGORITHM = "HS256"
+HEADLESS_JWT_PRIVATE_KEY = env("HEADLESS_JWT_PRIVATE_KEY", default="EAphd1a9MvV7ODmazWv6eAi5UEVlJstIUn4jVqThiKm7M6yVUwPMGlC84_r0z0NM")
+HEADLESS_JWT_ACCESS_TOKEN_EXPIRES_IN = 86400
 
 # Social account settings
 SOCIALACCOUNT_EMAIL_VERIFICATION = env('SOCIALACCOUNT_EMAIL_VERIFICATION', default='none')
@@ -269,11 +297,6 @@ SOCIALACCOUNT_PROVIDERS = {
             'access_type': 'online',
         },
     }
-}
-
-# Djanto rest auth (dj-rest-auth)
-REST_AUTH = {
-    'USE_JWT': True,
 }
 
 # Ledger integrity (lihat BLOCK_SIGNING.md)
@@ -339,4 +362,19 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'snailstamp.ledger.process_queue_batch',
         'schedule': 5.0,
     },
+}
+
+# Sending email
+MAILERS = {
+    'default': {
+        'BACKEND': 'django.core.mail.backends.smtp.EmailBackend',
+        'OPTIONS': {
+            'host': 'smtp.gmail.com',
+            'port': 587,
+            'use_tls': True,
+            'username': 'curiosift@gmail.com',
+            'password': 'mdfrheidlxjjousj',
+            'timeout': 10,
+        },
+    }
 }

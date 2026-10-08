@@ -1,4 +1,5 @@
 import dj_database_url
+from corsheaders.defaults import default_headers
 from .base import *
 
 env = environ.Env(
@@ -24,3 +25,12 @@ DATABASES = {
         conn_max_age=600,
     )
 }
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8100",
+]
+
+CORS_ALLOW_HEADERS = (
+    *default_headers,
+    "x-session-token",
+)
