@@ -1,14 +1,18 @@
-from rest_framework.views import APIView
+from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
-from snailstamp.apps.ledger.services import create_entry
-from .serializers import CreateEntrySerializer, BaseEntrySerializer
+from snailstamp.apps.ledger.services import create_entry, update_entry
+from snailstamp.apps.ledger.models import Entry
+from .serializers import CreateEntrySerializer, UpdateEntrySerializer, BaseEntrySerializer
 
 
-class CreateEntryView(APIView):
+class ListCreateEntryView(generics.ListCreateAPIView):
+    queryset = Entry.objects.all()
     permission_classes = (IsAuthenticated,)
+    serializer_class = CreateEntrySerializer
 
     @extend_schema(
         tags=["Ledger"],
@@ -56,8 +60,39 @@ class CreateEntryView(APIView):
         ],
     )
     @transaction.atomic
-    def post(self, request, *args, **kwargs):
+    def create(self, request, *args, **kwargs):
         serializer = CreateEntrySerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         entry = create_entry(**serializer.validated_data)
-        return Response({"entry_id": str(entry)}, status=201)
+
+        # get entry instance to serialize it
+        instance = get_object_or_404(Entry, pk=entry)
+        entry_serializer = BaseEntrySerializer(instance=instance)
+        return Response(entry_serializer.data, status=201)
+
+
+class RetrieveUpdateEntryView(generics.RetrieveUpdateAPIView):
+    queryset = Entry.objects.all()
+    permission_classes = (IsAuthenticated,)
+    serializer_class = BaseEntrySerializer
+
+    @extend_schema(
+            tags=["Ledger"],
+            summary="Retrieve or update a ledger entry",
+    )
+    @transaction.atomic
+    def partial_update(self, request, pk=None, *args, **kwargs):
+        # check entry exists and is owned by the user
+        entry = get_object_or_404(Entry, pk=pk)
+        serializer = UpdateEntrySerializer(
+            data=request.data,
+            instance=entry,
+            context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        entry = update_entry(pk, **serializer.validated_data)
+    
+        # get entry instance to serialize it
+        instance = get_object_or_404(Entry, pk=entry)
+        entry_serializer = BaseEntrySerializer(instance=instance)
+        return Response(entry_serializer.data, status=201)

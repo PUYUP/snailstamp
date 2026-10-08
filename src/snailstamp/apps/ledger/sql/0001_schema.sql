@@ -25,6 +25,13 @@
 --  transfer_tokens = token rahasia untuk klaim item (via QR)
 --  blocks       = checkpoint global (Merkle root per jendela waktu)
 --
+--  ATURAN ENTRY:
+--    * entry BOLEH diubah (reason/supply/kind/metadata) dan BOLEH dihapus, tetapi HANYA selama
+--      minted_count = 0. Begitu ada item lahir, content_hash entry menjadi benih genesis
+--      semua chain item -> isinya beku dan entry tidak bisa dihapus.
+--    * Kolom identitas (id, issuer_id, issuer_member_id, created_at) beku selamanya.
+--    * Perubahan hanya lewat ledger_update_entry / ledger_delete_entry.
+--
 --  IDENTITAS:  association -> member -> user
 --    * KEPEMILIKAN menempel ke ASSOCIATION (entries.issuer_id, collections.owner_id,
 --      holdings.owner_id, logs.actor_id/counterparty_id, transfer_tokens.*_association_id),
@@ -316,7 +323,7 @@ CREATE TRIGGER ledger_logs_no_truncate   BEFORE TRUNCATE ON ledger_logs
 CREATE TRIGGER ledger_blocks_append_only BEFORE UPDATE OR DELETE ON ledger_blocks
   FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
 
--- collection & entry: tidak boleh dihapus; kolom identitasnya beku
+-- collection: tidak boleh dihapus; kolom identitasnya beku
 CREATE TRIGGER ledger_collections_no_delete BEFORE DELETE ON ledger_collections
   FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
 CREATE TRIGGER ledger_collections_no_truncate BEFORE TRUNCATE ON ledger_collections
@@ -338,13 +345,50 @@ CREATE TRIGGER ledger_actions_frozen BEFORE UPDATE ON ledger_actions
 CREATE TRIGGER ledger_actions_no_delete BEFORE DELETE ON ledger_actions
   FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
 
-CREATE TRIGGER ledger_entries_no_delete BEFORE DELETE ON ledger_entries
-  FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
+-- ENTRY: boleh diubah dan dihapus, tapi hanya selama belum ada item ter-mint.
+-- Setelah mint, content_hash entry menjadi benih genesis semua item -> isinya harus beku.
+
+-- kolom identitas: beku selamanya (kind TIDAK termasuk: ia boleh berubah selama minted_count = 0)
 CREATE TRIGGER ledger_entries_frozen BEFORE UPDATE ON ledger_entries
   FOR EACH ROW
-  WHEN ((OLD.id, OLD.issuer_id, OLD.issuer_member_id, OLD.reason, OLD.supply, OLD.kind, OLD.metadata, OLD.content_hash, OLD.created_at)
-        IS DISTINCT FROM (NEW.id, NEW.issuer_id, NEW.issuer_member_id, NEW.reason, NEW.supply, NEW.kind, NEW.metadata, NEW.content_hash, NEW.created_at))
+  WHEN ((OLD.id, OLD.issuer_id, OLD.issuer_member_id, OLD.created_at)
+        IS DISTINCT FROM (NEW.id, NEW.issuer_id, NEW.issuer_member_id, NEW.created_at))
   EXECUTE FUNCTION ledger_forbid_mutation();
+
+-- kolom isi: hanya lewat ledger_update_entry (flag lokal-transaksi) dan hanya kalau minted_count = 0.
+-- minted_count sengaja tidak masuk WHEN, supaya ledger_mint_batch tetap bisa menaikkannya.
+CREATE OR REPLACE FUNCTION ledger_entries_guard_edit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('ledger.entry_edit', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'entry hanya boleh diubah lewat ledger_update_entry' USING ERRCODE = 'LG005';
+  END IF;
+  IF OLD.minted_count > 0 THEN
+    RAISE EXCEPTION 'entry % tidak boleh diubah: sudah ada % item ter-mint', OLD.id, OLD.minted_count
+      USING ERRCODE = 'LG003';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER ledger_entries_edit_guard BEFORE UPDATE ON ledger_entries
+  FOR EACH ROW
+  WHEN ((OLD.reason, OLD.supply, OLD.kind, OLD.metadata, OLD.content_hash)
+        IS DISTINCT FROM (NEW.reason, NEW.supply, NEW.kind, NEW.metadata, NEW.content_hash))
+  EXECUTE FUNCTION ledger_entries_guard_edit();
+
+-- delete: hanya lolos kalau minted_count = 0
+CREATE OR REPLACE FUNCTION ledger_entries_guard_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.minted_count > 0 THEN
+    RAISE EXCEPTION 'entry % tidak boleh dihapus: sudah ada % item ter-mint', OLD.id, OLD.minted_count
+      USING ERRCODE = 'LG003';
+  END IF;
+  RETURN OLD;  -- wajib, kalau tidak DELETE dibatalkan diam-diam
+END $$;
+
+CREATE TRIGGER ledger_entries_no_delete BEFORE DELETE ON ledger_entries
+  FOR EACH ROW EXECUTE FUNCTION ledger_entries_guard_delete();
+CREATE TRIGGER ledger_entries_no_truncate BEFORE TRUNCATE ON ledger_entries
+  FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation();
 
 -- ---------------------------------------------------------------------
 -- 11. FUNGSI TULIS (satu-satunya jalan menulis)
@@ -447,6 +491,92 @@ BEGIN
   VALUES (v_id, p_issuer, p_issuer_member, p_reason, p_supply, p_kind, p_metadata,
           ledger_entry_hash(v_id, p_issuer, p_issuer_member, p_reason, p_supply, p_kind, p_metadata, v_now), v_now);
   RETURN v_id;
+END $$;
+
+-- ENTRY UPDATE: ubah reason / supply / metadata / kind. NULL = tidak diubah.
+-- Hanya selama minted_count = 0 (setelah mint, hash entry jadi benih chain item,
+-- dan collections.kind adalah salinan beku dari entries.kind).
+-- metadata MENGGANTI seluruh isi lama (bukan merge); '{}' = kosongkan.
+-- kind 0 (generic) adalah nilai sah, berbeda dari NULL (= tidak diubah).
+-- Jenis `restricted` hanya boleh dipilih penerbit resmi, sama seperti di ledger_create_entry.
+CREATE OR REPLACE FUNCTION ledger_update_entry(p_entry_id bigint, p_issuer uuid, p_issuer_member uuid,
+                                    p_reason text DEFAULT NULL, p_supply int DEFAULT NULL,
+                                    p_metadata jsonb DEFAULT NULL, p_kind smallint DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE e ledger_entries;
+BEGIN
+  PERFORM ledger_require_actor(p_issuer, p_issuer_member);
+  IF p_reason IS NULL AND p_supply IS NULL AND p_metadata IS NULL AND p_kind IS NULL THEN
+    RAISE EXCEPTION 'tidak ada yang diubah' USING ERRCODE = 'LG004';
+  END IF;
+
+  SELECT * INTO e FROM ledger_entries WHERE id = p_entry_id FOR UPDATE;  -- serial dengan ledger_mint_batch
+  IF NOT FOUND THEN RAISE EXCEPTION 'entry % tidak ada', p_entry_id USING ERRCODE = 'LG001'; END IF;
+  IF e.issuer_id <> p_issuer THEN
+    RAISE EXCEPTION 'hanya issuer yang boleh mengubah entry' USING ERRCODE = 'LG002';
+  END IF;
+  IF e.minted_count > 0 THEN
+    RAISE EXCEPTION 'entry % tidak boleh diubah: sudah ada % item ter-mint', e.id, e.minted_count
+      USING ERRCODE = 'LG003';
+  END IF;
+
+  IF p_reason IS NOT NULL THEN
+    IF length(btrim(p_reason)) = 0 THEN
+      RAISE EXCEPTION 'reason wajib diisi' USING ERRCODE = 'LG004';
+    END IF;
+    e.reason := p_reason;
+  END IF;
+  IF p_supply IS NOT NULL THEN
+    IF p_supply < 1 THEN
+      RAISE EXCEPTION 'supply harus >= 1' USING ERRCODE = 'LG004';
+    END IF;
+    e.supply := p_supply;
+  END IF;
+  IF p_metadata IS NOT NULL THEN
+    e.metadata := p_metadata;
+  END IF;
+  IF p_kind IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM ledger_kinds WHERE id = p_kind) THEN
+      RAISE EXCEPTION 'kind % tidak ada di registry', p_kind USING ERRCODE = 'LG004';
+    END IF;
+    IF EXISTS (SELECT 1 FROM ledger_kinds WHERE id = p_kind AND restricted)
+       AND NOT EXISTS (SELECT 1 FROM ledger_kind_issuers WHERE kind_id = p_kind AND association_id = p_issuer) THEN
+      RAISE EXCEPTION 'jenis "%" hanya boleh dibuat oleh penerbit resmi',
+        (SELECT code FROM ledger_kinds WHERE id = p_kind) USING ERRCODE = 'LG002';
+    END IF;
+    e.kind := p_kind;
+  END IF;
+
+  e.content_hash := ledger_entry_hash(e.id, e.issuer_id, e.issuer_member_id, e.reason,
+                                      e.supply, e.kind, e.metadata, e.created_at);
+
+  PERFORM set_config('ledger.entry_edit', 'on', true);   -- true = hanya berlaku di transaksi ini
+  UPDATE ledger_entries
+     SET reason = e.reason, supply = e.supply, kind = e.kind, metadata = e.metadata,
+         content_hash = e.content_hash
+   WHERE id = e.id;
+  PERFORM set_config('ledger.entry_edit', 'off', true);
+  RETURN e.id;
+END $$;
+
+-- ENTRY DELETE: hanya kalau belum ada item ter-mint (minted_count = 0).
+CREATE OR REPLACE FUNCTION ledger_delete_entry(p_entry_id bigint, p_issuer uuid, p_issuer_member uuid)
+RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE e ledger_entries;
+BEGIN
+  PERFORM ledger_require_actor(p_issuer, p_issuer_member);
+  SELECT * INTO e FROM ledger_entries WHERE id = p_entry_id FOR UPDATE;  -- serial dengan ledger_mint_batch
+  IF NOT FOUND THEN RAISE EXCEPTION 'entry % tidak ada', p_entry_id USING ERRCODE = 'LG001'; END IF;
+  IF e.issuer_id <> p_issuer THEN
+    RAISE EXCEPTION 'hanya issuer yang boleh menghapus entry' USING ERRCODE = 'LG002';
+  END IF;
+  IF e.minted_count > 0 THEN
+    RAISE EXCEPTION 'entry % tidak boleh dihapus: sudah ada % item ter-mint', e.id, e.minted_count
+      USING ERRCODE = 'LG003';
+  END IF;
+
+  DELETE FROM ledger_entries WHERE id = e.id;
+  RETURN e.id;
 END $$;
 
 -- MINT: lahirkan item berikutnya (serial minted_count+1 ...). Panggil berulang
@@ -849,9 +979,26 @@ END $$;
 --     aplikasi TIDAK boleh INSERT/UPDATE/DELETE langsung; hanya SELECT + EXECUTE.
 --     Registry diubah lewat migrasi oleh role pemilik, bukan oleh aplikasi.
 --       CREATE ROLE ledger_app LOGIN PASSWORD '...';   -- sebelum migrasi
+--
+--     Fungsi SECURITY DEFINER bisa dieksekusi PUBLIC secara default, jadi REVOKE
+--     di bawah wajib supaya GRANT ke ledger_app benar-benar berarti.
+--     Setelah ini, aplikasi harus connect sebagai ledger_app atau pemilik fungsi.
 -- ---------------------------------------------------------------------
 REVOKE EXECUTE ON FUNCTION ledger_write_log(ledger_collections, smallint, uuid, uuid, uuid, jsonb,
                                             timestamptz, bigint, int, smallint, bytea, jsonb) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION
+  ledger_create_entry(uuid, uuid, text, int, jsonb, smallint),
+  ledger_update_entry(bigint, uuid, uuid, text, int, jsonb, smallint),
+  ledger_delete_entry(bigint, uuid, uuid),
+  ledger_mint_batch(bigint, uuid, uuid, int, varchar),
+  ledger_send(bigint, uuid, uuid, jsonb),
+  ledger_claim_transfer(uuid, uuid, uuid),
+  ledger_cancel_send(bigint, uuid, uuid),
+  ledger_assign(bigint, uuid, uuid, uuid),
+  ledger_use(bigint, uuid, uuid, smallint, jsonb),
+  ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb)
+FROM PUBLIC;
+
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') THEN
@@ -860,10 +1007,13 @@ BEGIN
                     ledger_kinds, ledger_actions, ledger_action_rules, ledger_kind_issuers TO ledger_app;
     GRANT INSERT ON ledger_blocks TO ledger_app;    -- sealer. Pisahkan ke role khusus bila perlu.
     GRANT EXECUTE ON FUNCTION ledger_create_entry(uuid, uuid, text, int, jsonb, smallint),
+                              ledger_update_entry(bigint, uuid, uuid, text, int, jsonb, smallint),
+                              ledger_delete_entry(bigint, uuid, uuid),
                               ledger_mint_batch(bigint, uuid, uuid, int, varchar),
                               ledger_send(bigint, uuid, uuid, jsonb),
                               ledger_claim_transfer(uuid, uuid, uuid),
                               ledger_cancel_send(bigint, uuid, uuid),
+                              ledger_assign(bigint, uuid, uuid, uuid),
                               ledger_use(bigint, uuid, uuid, smallint, jsonb),
                               ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb),
                               ledger_verify_chain(bigint) TO ledger_app;

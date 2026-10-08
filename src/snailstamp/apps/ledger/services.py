@@ -134,6 +134,27 @@ def create_entry(issuer_id, issuer_member_id, reason, supply, metadata=None, kin
                  [issuer_id, issuer_member_id, reason, supply, json.dumps(metadata or {}), _kind_id(kind)])
 
 
+def update_entry(entry_id, issuer_id, issuer_member_id, reason=None, supply=None, metadata=None, kind=None):
+    """Ubah entry yang sudah ada. Argumen None = tidak diubah.
+        issuer_id = association pemilik entry; issuer_member_id = member yang melakukan perubahan.
+        supply tidak boleh di bawah minted_count. metadata menggantikan seluruh isi lama
+        (bukan merge); metadata={} berarti dikosongkan, sedangkan None berarti tidak diubah."""
+    _check_member(issuer_id, issuer_member_id)
+    return _call(
+        "SELECT ledger_update_entry(%s, %s, %s, %s::text, %s::int, %s::jsonb, %s::smallint)",
+        [entry_id, issuer_id, issuer_member_id, reason, supply,
+         None if metadata is None else json.dumps(metadata),
+         None if kind is None else _kind_id(kind)])
+
+
+def delete_entry(entry_id, issuer_id, issuer_member_id):
+    """Hapus entry. Hanya boleh kalau minted_count = 0 (belum ada item ter-mint).
+    Mengembalikan id entry yang dihapus."""
+    _check_member(issuer_id, issuer_member_id)
+    return _call("SELECT ledger_delete_entry(%s, %s, %s)",
+                 [entry_id, issuer_id, issuer_member_id])
+
+
 def mint_batch(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
     """Lahirkan hingga `batch` item berikutnya. Return jumlah dibuat (0 = supply penuh).
     Member yang melahirkan dicatat di log seq 1 tiap item (boleh beda dari pembuat entry)."""

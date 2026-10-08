@@ -37,3 +37,23 @@ class CreateEntrySerializer(serializers.Serializer):
 
         attrs["issuer_member_id"] = member.id
         return attrs
+
+
+class UpdateEntrySerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=255)
+    supply = serializers.IntegerField(min_value=1)
+    metadata = serializers.JSONField(required=False, default=dict)
+    kind = serializers.IntegerField()
+
+    class Meta(BaseEntrySerializer.Meta):
+        fields = [
+            'reason',
+            'supply',
+            'metadata',
+            'kind', # an integer representing the kind of entry
+        ]
+
+    def validate(self, attrs):
+        attrs['issuer_id'] = self.instance.issuer_id
+        attrs['issuer_member_id'] = self.instance.issuer_member_id
+        return attrs

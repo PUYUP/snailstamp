@@ -1,6 +1,7 @@
 from django.urls import path
-from .views import CreateEntryView
+from .views import ListCreateEntryView, RetrieveUpdateEntryView
 
 urlpatterns = [
-    path('', CreateEntryView.as_view(), name='create-entry'),
+    path('', ListCreateEntryView.as_view(), name='create-entry'),
+    path('<int:pk>/', RetrieveUpdateEntryView.as_view(), name='retrieve-update-entry'),
 ]
