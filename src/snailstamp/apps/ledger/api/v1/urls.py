@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import path, include
 
 from .views import (
     ActionListView,
@@ -19,4 +19,6 @@ urlpatterns = [
     path("transactions/", QueueTransactionView.as_view(), name="transaction-create"),
     path("transactions/<int:transaction_id>/", QueuedTransactionDetailView.as_view(),
          name="transaction-detail"),
+
+    path("entries/", include("snailstamp.apps.ledger.api.v1.entry.urls")),
 ]

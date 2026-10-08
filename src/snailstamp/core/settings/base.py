@@ -196,15 +196,17 @@ if USE_S3:
 
 MAILERS = {
     'default': {
-        'BACKEND': env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend'),
+        'BACKEND': 'django.core.mail.backends.smtp.EmailBackend',
         'HOST': env('EMAIL_HOST', default='localhost'),
         'PORT': env.int('EMAIL_PORT', default=587),
         'USE_TLS': env.bool('EMAIL_USE_TLS', default=True),
         'USER': env('EMAIL_HOST_USER', default=''),
         'PASSWORD': env('EMAIL_HOST_PASSWORD', default=''),
         'DEFAULT_FROM_EMAIL': env('DEFAULT_FROM_EMAIL', default='noreply@snailstamp.com'),
+        'TIMEOUT': env.int('EMAIL_TIMEOUT', default=10),
     },
 }
+
 
 AUTH_USER_MODEL='users.User'
 AUTHENTICATION_BACKENDS = (

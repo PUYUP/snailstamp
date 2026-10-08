@@ -13,8 +13,10 @@ constraint fisik (db_constraint=False).
 """
 import uuid
 
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
+
+from .models_manager import EntryManager
 
 
 class LedgerWriteForbidden(RuntimeError):
@@ -122,6 +124,8 @@ class Entry(LedgerModel):
     metadata = models.JSONField()
     content_hash = models.BinaryField()
     created_at = models.DateTimeField()
+
+    objects = EntryManager()
 
     class Meta(LedgerModel.Meta):
         db_table = "ledger_entries"
