@@ -38,6 +38,11 @@ class CreateEntrySerializer(serializers.Serializer):
         attrs["issuer_member_id"] = member.id
         return attrs
 
+    def to_representation(self, instance):
+        """Override to_representation to include issuer_member_id in the output."""
+        serializer = BaseEntrySerializer(instance=instance, context=self.context)
+        return serializer.data
+
 
 class UpdateEntrySerializer(serializers.Serializer):
     reason = serializers.CharField(max_length=255)
@@ -57,3 +62,8 @@ class UpdateEntrySerializer(serializers.Serializer):
         attrs['issuer_id'] = self.instance.issuer_id
         attrs['issuer_member_id'] = self.instance.issuer_member_id
         return attrs
+
+    def to_representation(self, instance):
+        """Override to_representation to include issuer_member_id in the output."""
+        serializer = BaseEntrySerializer(instance=instance, context=self.context)
+        return serializer.data

@@ -1,5 +1,3 @@
-from django.core.exceptions import PermissionDenied
-from rest_framework.decorators import permission_classes
 from drf_spectacular.utils import extend_schema
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -9,6 +7,7 @@ from rest_framework import generics
 from snailstamp.apps.tenant.models import Member, Association
 from django.utils.translation import gettext_lazy as _
 from django.db import transaction
+from django.core.exceptions import PermissionDenied
 
 from .serializers import (
     MembershipSerializer,

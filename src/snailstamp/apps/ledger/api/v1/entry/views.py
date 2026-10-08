@@ -2,9 +2,10 @@ from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
-from snailstamp.apps.ledger.services import create_entry, update_entry
+from snailstamp.apps.ledger.services import create_entry, update_entry, delete_entry
 from snailstamp.apps.ledger.models import Entry
 from .serializers import CreateEntrySerializer, UpdateEntrySerializer, BaseEntrySerializer
 
@@ -71,28 +72,29 @@ class ListCreateEntryView(generics.ListCreateAPIView):
         return Response(entry_serializer.data, status=201)
 
 
-class RetrieveUpdateEntryView(generics.RetrieveUpdateAPIView):
+class RetrieveUpdateDestroyEntryView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Entry.objects.all()
     permission_classes = (IsAuthenticated,)
     serializer_class = BaseEntrySerializer
 
-    @extend_schema(
-            tags=["Ledger"],
-            summary="Retrieve or update a ledger entry",
-    )
-    @transaction.atomic
-    def partial_update(self, request, pk=None, *args, **kwargs):
-        # check entry exists and is owned by the user
-        entry = get_object_or_404(Entry, pk=pk)
-        serializer = UpdateEntrySerializer(
+    def perform_update(self, serializer):
+        request = serializer.context["request"]
+        instance = serializer.instance
+        if instance.issuer.users.filter(id__in=[self.request.user.id], tenant_member__is_admin=False).exists():
+            raise PermissionDenied
+
+        update_serializer = UpdateEntrySerializer(
             data=request.data,
-            instance=entry,
+            instance=instance,
             context={"request": request}
         )
-        serializer.is_valid(raise_exception=True)
-        entry = update_entry(pk, **serializer.validated_data)
-    
-        # get entry instance to serialize it
-        instance = get_object_or_404(Entry, pk=entry)
-        entry_serializer = BaseEntrySerializer(instance=instance)
-        return Response(entry_serializer.data, status=201)
+        update_serializer.is_valid(raise_exception=True)
+        update_entry(instance.pk, **update_serializer.validated_data)
+        instance.refresh_from_db()  # Refresh the instance to get the latest data after update
+        return instance
+
+    def perform_destroy(self, instance):
+        # only admin can delete
+        if instance.issuer.users.filter(id__in=[self.request.user.id], tenant_member__is_admin=False).exists():
+            raise PermissionDenied
+        delete_entry(entry_id=instance.pk, issuer_id=instance.issuer_id, issuer_member_id=instance.issuer_member_id)
