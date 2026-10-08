@@ -439,6 +439,24 @@ RETURN jsonb_build_object(
     FROM ledger_assets a
     WHERE a.collection_id = c.id AND a.status = 'active'
     LIMIT 1
+  ),
+  'content', (
+    SELECT jsonb_build_object(
+      'id', cnt.id,
+      'title', cnt.title,
+      'format', cnt.format,
+      'body', cnt.body,
+      'excerpt', cnt.excerpt,
+      'content_hash', cnt.content_hash,
+      'char_count', cnt.char_count,
+      'status', cnt.status,
+      'metadata', cnt.metadata,
+      'created_at', cnt.created_at,
+      'updated_at', cnt.updated_at
+    )
+    FROM ledger_contents cnt
+    WHERE cnt.collection_id = c.id AND cnt.status = 'active'
+    LIMIT 1
   )
 );
 END $$;

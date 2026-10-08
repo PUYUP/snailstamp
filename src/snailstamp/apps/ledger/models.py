@@ -472,4 +472,5 @@ class QueuedTransaction(models.Model):
             models.Index(fields=["association_id", "created_at"], name="ledger_queue_rate_idx"),
         ]
 
-from .assets import Asset  # noqa: F401  (daftarkan model Asset ke app ledger)
+from .models_assets import Asset  # noqa: F401  (daftarkan model Asset ke app ledger)
+from .models_content import Content  # noqa: F401  (daftarkan model Content ke app ledger)

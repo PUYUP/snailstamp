@@ -1387,7 +1387,7 @@ def upload_asset(collection_id, actor_id, actor_member_id, file_obj,
                 file_obj.seek(0)
 
     # Import Asset model (delayed import untuk circular dependency)
-    from .assets import Asset
+    from .models_assets import Asset
 
     # Cek asset lama jika replace_existing
     old_asset = None
@@ -1475,7 +1475,7 @@ def get_asset(collection_id, status=None):
     Returns:
         Asset object atau None
     """
-    from .assets import Asset
+    from .models_assets import Asset
 
     qs = Asset.objects.filter(collection_id=collection_id)
 
@@ -1483,3 +1483,93 @@ def get_asset(collection_id, status=None):
         qs = qs.filter(status=status)
 
     return qs.first()
+
+
+# ---------------------------------------------------------------- content management
+# Fungsi untuk mencatat dan menyimpan content text (judul, isi tulisan) ke collection.
+
+def add_or_update_content(collection_id, actor_id, actor_member_id, body,
+                          title="", format="plain", metadata=None,
+                          action_code="write"):
+    """
+    Tulis/update content dan catat di ledger.
+    
+    Args:
+        collection_id: ID collection yang terkait dengan content
+        actor_id: ID association pemilik collection
+        actor_member_id: ID member yang melakukan aksi
+        body: Isi utama teks
+        title: Judul atau label singkat (opsional)
+        format: plain / markdown / html / json
+        metadata: Dictionary metadata tambahan (opsional)
+        action_code: Kode aksi untuk log ledger (default: "write")
+        
+    Returns:
+        (content_id, seq) - ID Content yang dibuat/diupdate dan seq log di ledger
+    """
+    _check_member(actor_id, actor_member_id)
+
+    # Hitung hash
+    content_hash = content_sha256(body)
+    hash_hex = content_hash.hex()
+    
+    # Delayed import untuk menghindari circular import
+    from .models_content import Content
+    
+    # Ambil content lama jika ada
+    content = Content.objects.filter(
+        collection_id=collection_id,
+        status=Content.ContentStatus.ACTIVE
+    ).first()
+    
+    if content:
+        content.title = title
+        content.body = body
+        content.format = format
+        content.content_hash = hash_hex
+        content.metadata = metadata or {}
+        content.save()
+    else:
+        content = Content.objects.create(
+            collection_id=collection_id,
+            title=title,
+            body=body,
+            format=format,
+            content_hash=hash_hex,
+            metadata=metadata or {},
+            created_by_member_id=actor_member_id
+        )
+
+    # Log ke ledger (ACTED_ON event)
+    payload = {
+        "content_id": str(content.id),
+        "title": title,
+        "format": format,
+        "char_count": content.char_count,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+
+    seq = act(action_code, collection_id, collection_id, actor_id, actor_member_id,
+              content_hash=content_hash, payload=payload)[0]
+
+    return str(content.id), seq
+
+
+def get_content(collection_id, status=None):
+    """
+    Ambil Content untuk collection tertentu.
+    
+    Args:
+        collection_id: ID collection
+        status: Filter status (None = semua)
+        
+    Returns:
+        Content object atau None
+    """
+    from .models_content import Content
+    qs = Content.objects.filter(collection_id=collection_id)
+    if status is not None:
+        qs = qs.filter(status=status)
+    return qs.first()
+
