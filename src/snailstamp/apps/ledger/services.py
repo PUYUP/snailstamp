@@ -125,26 +125,26 @@ def _check_member(association_id, member_id):
         raise Forbidden("member ini bukan anggota association tersebut")
 
 
-def create_entry(issuer_id, issuer_member_id, reason, supply, metadata=None, kind=0):
+def create_entry(issuer_id, issuer_member_id, reason, supply, metadata=None, kind=0, max_as_tool=None, max_as_target=None):
     """Catat alasan + total supply. `kind`: kode registry ("pen") atau id; 0/"generic" = benda umum.
     Item baru ada setelah mint_all().
     issuer_id = association penerbit; issuer_member_id = member yang membuat entry."""
     _check_member(issuer_id, issuer_member_id)
-    return _call("SELECT ledger_create_entry(%s, %s, %s, %s, %s::jsonb, %s::smallint)",
-                 [issuer_id, issuer_member_id, reason, supply, json.dumps(metadata or {}), _kind_id(kind)])
+    return _call("SELECT ledger_create_entry(%s, %s, %s, %s, %s::jsonb, %s::smallint, %s::int, %s::int)",
+                 [issuer_id, issuer_member_id, reason, supply, json.dumps(metadata or {}), _kind_id(kind), max_as_tool, max_as_target])
 
 
-def update_entry(entry_id, issuer_id, issuer_member_id, reason=None, supply=None, metadata=None, kind=None):
+def update_entry(entry_id, issuer_id, issuer_member_id, reason=None, supply=None, metadata=None, kind=None, max_as_tool=None, max_as_target=None):
     """Ubah entry yang sudah ada. Argumen None = tidak diubah.
         issuer_id = association pemilik entry; issuer_member_id = member yang melakukan perubahan.
         supply tidak boleh di bawah minted_count. metadata menggantikan seluruh isi lama
         (bukan merge); metadata={} berarti dikosongkan, sedangkan None berarti tidak diubah."""
     _check_member(issuer_id, issuer_member_id)
     return _call(
-        "SELECT ledger_update_entry(%s, %s, %s, %s::text, %s::int, %s::jsonb, %s::smallint)",
+        "SELECT ledger_update_entry(%s, %s, %s, %s::text, %s::int, %s::jsonb, %s::smallint, %s::int, %s::int)",
         [entry_id, issuer_id, issuer_member_id, reason, supply,
          None if metadata is None else json.dumps(metadata),
-         None if kind is None else _kind_id(kind)])
+         None if kind is None else _kind_id(kind), max_as_tool, max_as_target])
 
 
 def delete_entry(entry_id, issuer_id, issuer_member_id):
@@ -156,27 +156,29 @@ def delete_entry(entry_id, issuer_id, issuer_member_id):
 
 
 def mint_batch(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
-    """Lahirkan hingga `batch` item berikutnya. Return jumlah dibuat (0 = supply penuh).
-    Member yang melahirkan dicatat di log seq 1 tiap item (boleh beda dari pembuat entry)."""
+    """Lahirkan hingga `batch` item berikutnya. Return array ID yang dibuat."""
     _check_member(issuer_id, issuer_member_id)
     return _call("SELECT ledger_mint_batch(%s, %s, %s, %s, %s)", [entry_id, issuer_id, issuer_member_id, batch, prefix])
 
 
 def mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=""):
     """Mint seluruh supply. Tiap batch = transaksi sendiri (jangan panggil di dalam atomic() besar)."""
-    total = 0
-    while (n := mint_batch(entry_id, issuer_id, issuer_member_id, batch, prefix)):
-        total += n
+    total = []
+    while True:
+        ids = mint_batch(entry_id, issuer_id, issuer_member_id, batch, prefix)
+        if not ids:
+            break
+        total.extend(ids)
     return total
 
 
-def create_item(issuer_id, issuer_member_id, reason, quantity, kind_code, metadata=None, prefix=""):
+def create_item(issuer_id, issuer_member_id, reason, quantity, kind_code, metadata=None, prefix="", max_as_tool=None, max_as_target=None):
     """Buat `quantity` item sejenis (kode jenis dari registry: "pen", "letter", "stamp", ...).
     Return (entry_id, [collection_id, ...])."""
     with transaction.atomic():
-        entry_id = create_entry(issuer_id, issuer_member_id, reason, quantity, metadata, kind=kind_code)
-        mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=prefix)
-    return entry_id, list(Collection.objects.filter(entry_id=entry_id).values_list("id", flat=True))
+        entry_id = create_entry(issuer_id, issuer_member_id, reason, quantity, metadata, kind=kind_code, max_as_tool=max_as_tool, max_as_target=max_as_target)
+        ids = mint_all(entry_id, issuer_id, issuer_member_id, batch=10_000, prefix=prefix)
+    return entry_id, ids
 
 
 def send(collection_id, actor_id, actor_member_id, payload=None):
@@ -270,8 +272,18 @@ def act(action_code, tool_id, target_id, actor_id, actor_member_id, content=None
                        [_action_id(action_code), tool_id, target_id, actor_id, actor_member_id, content_hash, _json(payload)], row=True))
 
 
-def content_sha256(content):
-    return hashlib.sha256(content.encode("utf-8") if isinstance(content, str) else content).digest()
+def content_sha256(content, version=1):
+    # 1. Siapkan prefix versi (misal menjadi "hash_version_1:") dalam bentuk bytes
+    version_prefix = f"hash_version_{version}:".encode("utf-8")
+    
+    # 2. Konversi konten ke bytes jika masih string
+    content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+    
+    # 3. Gabungkan prefix versi dengan konten asli
+    payload_to_hash = version_prefix + content_bytes
+    
+    # 4. Lakukan hashing pada gabungan tersebut
+    return hashlib.sha256(payload_to_hash).digest()
 
 
 def verify_content(collection_id, seq, content):
@@ -1302,21 +1314,29 @@ def verify_proof(proof, trusted_keys=None, threshold=1, min_regions=1):
 # File disimpan dengan content-addressable storage (nama = hash) untuk deduplication.
 # Integritas diverifikasi lewat ledger (content_hash di log ACTED_ON).
 
-def _file_sha256(file_obj):
-    """Hitung SHA256 file. file_obj bisa berupa File object atau path string."""
+def _file_sha256(file_obj, version=1):
+    """Hitung SHA256 file dengan menyertakan versi. file_obj bisa berupa File object atau path string."""
+    version_prefix = f"hash_version_{version}:".encode("utf-8")
     hasher = hashlib.sha256()
+
+    # 1. Masukkan prefix versi ke dalam perhitungan hash di awal
+    hasher.update(version_prefix)
+
+    # 2. Proses pembacaan file (secara streaming agar hemat memori)
     if isinstance(file_obj, str):
         with open(file_obj, 'rb') as f:
             for chunk in iter(lambda: f.read(8192), b''):
                 hasher.update(chunk)
     else:
-        # File object (Django UploadedFile)
+        # File object (Django UploadedFile / InMemoryUploadedFile / TemporaryUploadedFile)
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
-        for chunk in iter(lambda: file_obj.read(8192), b''):
+        for chunk in iter(lambda: f.read(8192), b''):
             hasher.update(chunk)
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
+            
+    # 3. Kembalikan dalam bentuk bytes (atau gunakan .hexdigest() jika ingin string hex)
     return hasher.digest()
 
 

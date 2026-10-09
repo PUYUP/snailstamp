@@ -62,6 +62,25 @@
 --      1 byte per baris = 1 TB.
 -- =====================================================================
 
+-- ---------------------------------------------------------------------
+--  PERBAIKAN KRITIS (revisi ini)
+--   1. ledger_mint_batch: ")" ganda di CTE membuat fungsi gagal dibuat -> diperbaiki.
+--   2. state_snapshot DIBUANG (kolom, fungsi ledger_collection_snapshot, parameter ledger_write_log):
+--      bergantung pada ledger_assets/ledger_contents yang tidak ada, menyalin isi teks ke tiap log
+--      (melanggar "isi tidak pernah masuk ledger"), dan tidak ikut hash.
+--   3. Deadlock claim vs cancel: keduanya kini mengunci collection DULU, baru token.
+--      cancel: satu UPDATE, tidak lagi me-NULL-kan holder tanpa log, token ditandai cancelled_at
+--      (tidak di-DELETE).
+--   4. ledger_transfer_tokens menyimpan sha256(token) (token_hash), bukan token mentah.
+--      Token mentah hanya keluar sekali dari ledger_send. Antarmuka send/claim tidak berubah.
+--   5. TRUNCATE ke partisi langsung kini ditolak (trigger per partisi); DROP tabel ledger ditolak
+--      oleh event trigger (butuh superuser; best-effort). ledger_blocks juga kebal TRUNCATE.
+--   6. ledger_app TIDAK lagi boleh INSERT ke ledger_blocks. Blok lahir dari ledger_seal_block
+--      (Merkle root dihitung dari log asli); ledger_verify_blocks memeriksa ulang. Jendela blok
+--      tidak boleh tumpang tindih (EXCLUDE).
+--   7. supply dibatasi 1..90.000.000 (ruang serial 8 digit; di atas itu serial bisa kembar diam-diam).
+-- ---------------------------------------------------------------------
+
 -- Kode error (SQLSTATE) khusus, dipetakan ke exception Python di services.py
 --   LG001 tidak ditemukan | LG002 bukan hak anda | LG003 state tidak valid
 --   LG004 input tidak valid | LG005 tabel append-only
@@ -150,7 +169,7 @@ CREATE TABLE ledger_entries (
     issuer_id        uuid     NOT NULL,                 -- association penerbit
     issuer_member_id uuid     NOT NULL,                 -- member yang membuat entry
     reason        text        NOT NULL,                 -- alasan / landasan
-    supply        integer     NOT NULL CHECK (supply > 0),  -- jumlah TOTAL yang boleh ada, selamanya
+    supply        integer     NOT NULL CHECK (supply BETWEEN 1 AND 90000000),  -- jumlah TOTAL selamanya; batas = ruang serial 8 digit di ledger_mint_batch
     kind          smallint    NOT NULL DEFAULT 0 REFERENCES ledger_kinds (id),
     minted_count  integer     NOT NULL DEFAULT 0,
     metadata      jsonb       NOT NULL DEFAULT '{}',
@@ -204,9 +223,11 @@ CREATE TABLE ledger_logs (
     event_type      smallint    NOT NULL,   -- 1 MINT, 2 SEND, 3 RECEIVE, 4 USE (alat), 5 CANCEL_SEND, 6 ASSIGN, 7 ACTED_ON (sasaran)
     action_id       smallint,               -- USE/ACTED_ON: kata kerja dari ledger_actions
     hash            bytea       NOT NULL,   -- sha256, 32 byte
+    hash_version    INT         NOT NULL DEFAULT 1, -- penanda versi pada struktur log agar jika algoritma hash (SHA-256) atau secret pepper diganti di masa depan, sistem verifikasi historis tidak error.
     content_hash    bytea,                  -- ACTED_ON: sha256 isi (tulisan/foto/...). Isi asli di luar ledger
     payload         jsonb,                  -- metadata kecil bebas (maks 4 KB). JANGAN isi data pribadi
-    state_snapshot  jsonb,                  -- JSON snapshot Collection state saat log dibuat (untuk rekonstruksi)
+    -- (state_snapshot DIBUANG: ia menyalin isi teks/aset ke tiap log, tidak ikut hash, dan state
+    --  sudah bisa direkonstruksi lewat replay di ledger_verify_chain.)
     PRIMARY KEY (collection_id, seq)
 ) PARTITION BY HASH (collection_id);
 
@@ -224,8 +245,10 @@ CREATE TABLE ledger_holdings (
 -- ---------------------------------------------------------------------
 -- 6. TRANSFER TOKENS (tidak dipartisi) -- token QR; satu aktif per collection
 -- ---------------------------------------------------------------------
+--    Token mentah (uuid) TIDAK disimpan: hanya sha256-nya. Token mentah dikembalikan SEKALI oleh
+--    ledger_send (untuk QR). Bocornya akses-baca ke tabel ini tidak lagi membuat item bisa diklaim.
 CREATE TABLE ledger_transfer_tokens (
-    token           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    token_hash      bytea       PRIMARY KEY CHECK (octet_length(token_hash) = 32),
     collection_id   bigint      NOT NULL,
     from_association_id uuid    NOT NULL,
     from_member_id  uuid        NOT NULL,               -- member pengirim
@@ -234,12 +257,14 @@ CREATE TABLE ledger_transfer_tokens (
     claimed_by_id   uuid,                         -- association penerima; NULL sampai diklaim
     claimed_by_member_id uuid,                    -- member penerima;      NULL sampai diklaim
     claimed_at      timestamptz,                  -- NULL sampai diklaim
-    CHECK ((claimed_by_id IS NULL) = (claimed_at IS NULL) AND (claimed_by_member_id IS NULL) = (claimed_by_id IS NULL))
+    cancelled_at    timestamptz,                  -- NULL kecuali pengirim membatalkan (baris TIDAK dihapus: jejak)
+    CHECK ((claimed_by_id IS NULL) = (claimed_at IS NULL) AND (claimed_by_member_id IS NULL) = (claimed_by_id IS NULL)),
+    CHECK (claimed_at IS NULL OR cancelled_at IS NULL)
 );
 
--- Hanya satu token aktif (belum diklaim) per collection
+-- Hanya satu token aktif (belum diklaim, belum dibatalkan) per collection
 CREATE UNIQUE INDEX ledger_transfer_tokens_active_idx
-    ON ledger_transfer_tokens (collection_id) WHERE claimed_by_id IS NULL;
+    ON ledger_transfer_tokens (collection_id) WHERE claimed_by_id IS NULL AND cancelled_at IS NULL;
 
 -- ---------------------------------------------------------------------
 -- 7. BLOCKS -- checkpoint global, saling bertaut
@@ -254,7 +279,10 @@ CREATE TABLE ledger_blocks (
     block_hash      bytea       NOT NULL,
     sealed_at       timestamptz NOT NULL DEFAULT now(),
     signatures      jsonb,      -- Array of sealer signatures for multi-sig [{"sealer_id": "uuid", "public_key": "hex", "signature": "hex"}]
-    CHECK (window_end > window_start)
+    CHECK (window_end > window_start),
+    CHECK (octet_length(merkle_root) = 32 AND octet_length(prev_block_hash) = 32 AND octet_length(block_hash) = 32),
+    -- jendela tidak boleh tumpang tindih (log yang sama tidak boleh masuk dua blok)
+    EXCLUDE USING gist (tstzrange(window_start, window_end) WITH &&)
 );
 
 -- ---------------------------------------------------------------------
@@ -312,8 +340,8 @@ END $$;
 -- Immutability: kolom identitas beku
 CREATE TRIGGER ledger_transfer_tokens_frozen BEFORE UPDATE ON ledger_transfer_tokens
   FOR EACH ROW
-  WHEN ((OLD.token, OLD.collection_id, OLD.from_association_id, OLD.from_member_id, OLD.created_at)
-        IS DISTINCT FROM (NEW.token, NEW.collection_id, NEW.from_association_id, NEW.from_member_id, NEW.created_at))
+  WHEN ((OLD.token_hash, OLD.collection_id, OLD.from_association_id, OLD.from_member_id, OLD.created_at)
+        IS DISTINCT FROM (NEW.token_hash, NEW.collection_id, NEW.from_association_id, NEW.from_member_id, NEW.created_at))
   EXECUTE FUNCTION ledger_forbid_mutation();
 
 CREATE TRIGGER ledger_logs_append_only   BEFORE UPDATE OR DELETE ON ledger_logs
@@ -322,6 +350,47 @@ CREATE TRIGGER ledger_logs_no_truncate   BEFORE TRUNCATE ON ledger_logs
   FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation();
 CREATE TRIGGER ledger_blocks_append_only BEFORE UPDATE OR DELETE ON ledger_blocks
   FOR EACH ROW EXECUTE FUNCTION ledger_forbid_mutation();
+CREATE TRIGGER ledger_blocks_no_truncate BEFORE TRUNCATE ON ledger_blocks
+  FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation();
+
+-- Trigger statement-level di tabel INDUK tidak diwariskan ke partisi, jadi
+-- `TRUNCATE ledger_logs_p007` meloloskan diri dari trigger di atas. Pasang di tiap partisi.
+-- (Trigger row-level di induk sudah otomatis ter-clone ke partisi oleh PostgreSQL >= 13.)
+DO $$
+DECLARE p regclass;
+BEGIN
+  FOR p IN SELECT inhrelid::regclass FROM pg_inherits
+            WHERE inhparent IN ('ledger_logs'::regclass, 'ledger_collections'::regclass)
+  LOOP
+    EXECUTE format('CREATE TRIGGER ledger_part_no_truncate BEFORE TRUNCATE ON %s
+                    FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation()', p);
+  END LOOP;
+END $$;
+
+-- DROP TABLE tidak bisa dicegat trigger biasa. Event trigger (butuh superuser) menggagalkan DROP
+-- tabel ledger / partisinya. Pasang HANYA bila privilese cukup; jika tidak, andalkan pemisahan role:
+-- aplikasi jangan pernah menjadi pemilik tabel. Migrasi yang sah harus menonaktifkan dulu:
+--   ALTER EVENT TRIGGER ledger_protect_drop DISABLE;   (superuser)
+-- Catatan: ALTER TABLE ... DETACH PARTITION tidak tertangkap di sini; jaga lewat kepemilikan.
+CREATE OR REPLACE FUNCTION ledger_guard_drop() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE o record;
+BEGIN
+  FOR o IN SELECT object_identity, object_name FROM pg_event_trigger_dropped_objects()
+            WHERE object_type = 'table' AND NOT is_temporary
+  LOOP
+    IF o.object_name ~ '^ledger_(entries|collections|logs|blocks)(_p[0-9]{3})?$' THEN
+      RAISE EXCEPTION 'DROP % dilarang: tabel ledger bersifat append-only (nonaktifkan event trigger ledger_protect_drop bila memang disengaja)',
+        o.object_identity USING ERRCODE = 'LG005';
+    END IF;
+  END LOOP;
+END $$;
+
+DO $$
+BEGIN
+  CREATE EVENT TRIGGER ledger_protect_drop ON sql_drop EXECUTE FUNCTION ledger_guard_drop();
+EXCEPTION WHEN insufficient_privilege THEN
+  RAISE NOTICE 'event trigger ledger_protect_drop TIDAK dibuat (butuh superuser); DROP tabel ledger hanya terlindung oleh kepemilikan role';
+END $$;
 
 -- collection: tidak boleh dihapus; kolom identitasnya beku
 CREATE TRIGGER ledger_collections_no_delete BEFORE DELETE ON ledger_collections
@@ -404,69 +473,11 @@ BEGIN
   END IF;
 END $$;
 
--- internal: generate JSON snapshot dari Collection state (untuk rekonstruksi)
--- plpgsql (bukan sql) supaya ledger_assets (dibuat di migrasi 0004) tidak divalidasi saat CREATE.
-CREATE OR REPLACE FUNCTION ledger_collection_snapshot(c ledger_collections) RETURNS jsonb
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
-RETURN jsonb_build_object(
-  'id', c.id,
-  'entry_id', c.entry_id,
-  'serial_no', c.serial_no,
-  'owner_id', c.owner_id,
-  'holder_id', c.holder_id,
-  'state', c.state,
-  'kind', c.kind,
-  'last_seq', c.last_seq,
-  'tool_uses', c.tool_uses,
-  'target_acts', c.target_acts,
-  'last_hash', encode(c.last_hash, 'hex'),
-  'created_at', c.created_at,
-  'updated_at', c.updated_at,
-  'asset', (
-    SELECT jsonb_build_object(
-      'id', a.id,
-      'storage_path', a.storage_path,
-      'content_hash', a.content_hash,
-      'original_filename', a.original_filename,
-      'file_size', a.file_size,
-      'mime_type', a.mime_type,
-      'status', a.status,
-      'metadata', a.metadata,
-      'uploaded_at', a.uploaded_at,
-      'updated_at', a.updated_at
-    )
-    FROM ledger_assets a
-    WHERE a.collection_id = c.id AND a.status = 'active'
-    LIMIT 1
-  ),
-  'content', (
-    SELECT jsonb_build_object(
-      'id', cnt.id,
-      'title', cnt.title,
-      'format', cnt.format,
-      'body', cnt.body,
-      'excerpt', cnt.excerpt,
-      'content_hash', cnt.content_hash,
-      'char_count', cnt.char_count,
-      'status', cnt.status,
-      'metadata', cnt.metadata,
-      'created_at', cnt.created_at,
-      'updated_at', cnt.updated_at
-    )
-    FROM ledger_contents cnt
-    WHERE cnt.collection_id = c.id AND cnt.status = 'active'
-    LIMIT 1
-  )
-);
-END $$;
-
 -- internal: tulis satu log + hitung hash chain. Dipanggil di bawah row-lock collection.
 CREATE OR REPLACE FUNCTION ledger_write_log(c ledger_collections, p_event smallint, p_actor uuid, p_actor_member uuid,
                                  p_counterparty uuid, p_payload jsonb, p_ts timestamptz,
                                  p_target_id bigint DEFAULT NULL, p_target_seq int DEFAULT NULL,
                                  p_action_id smallint DEFAULT NULL, p_content_hash bytea DEFAULT NULL,
-                                 p_state_snapshot jsonb DEFAULT NULL,
                                  OUT new_seq int, OUT new_hash bytea)
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -478,9 +489,9 @@ BEGIN
                               p_counterparty, p_ts, p_payload, p_target_id, p_target_seq,
                               p_action_id, p_content_hash);
   INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, target_id, created_at,
-                           seq, target_seq, event_type, action_id, hash, content_hash, payload, state_snapshot)
+                           seq, target_seq, event_type, action_id, hash, content_hash, payload)
   VALUES (c.id, p_actor, p_actor_member, p_counterparty, p_target_id, p_ts, new_seq, p_target_seq,
-          p_event, p_action_id, new_hash, p_content_hash, p_payload, p_state_snapshot);
+          p_event, p_action_id, new_hash, p_content_hash, p_payload);
 END $$;
 
 -- ENTRY: catat alasan + total supply. Item belum ada sampai di-mint.
@@ -490,8 +501,8 @@ RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_te
 DECLARE v_id bigint := nextval('ledger_entry_id_seq'); v_now timestamptz := clock_timestamp();
 BEGIN
   PERFORM ledger_require_actor(p_issuer, p_issuer_member);
-  IF p_supply IS NULL OR p_supply < 1 THEN
-    RAISE EXCEPTION 'supply harus >= 1' USING ERRCODE = 'LG004';
+  IF p_supply IS NULL OR p_supply < 1 OR p_supply > 90000000 THEN
+    RAISE EXCEPTION 'supply harus 1..90000000' USING ERRCODE = 'LG004';
   END IF;
   IF p_reason IS NULL OR length(btrim(p_reason)) = 0 THEN
     RAISE EXCEPTION 'reason wajib diisi' USING ERRCODE = 'LG004';
@@ -545,8 +556,8 @@ BEGIN
     e.reason := p_reason;
   END IF;
   IF p_supply IS NOT NULL THEN
-    IF p_supply < 1 THEN
-      RAISE EXCEPTION 'supply harus >= 1' USING ERRCODE = 'LG004';
+    IF p_supply < 1 OR p_supply > 90000000 THEN
+      RAISE EXCEPTION 'supply harus 1..90000000' USING ERRCODE = 'LG004';
     END IF;
     e.supply := p_supply;
   END IF;
@@ -598,11 +609,11 @@ BEGIN
 END $$;
 
 -- MINT: lahirkan item berikutnya (serial minted_count+1 ...). Panggil berulang
--- (mis. batch 10.000) sampai minted_count = supply. Mengembalikan jumlah yang dibuat.
+-- (mis. batch 10.000) sampai minted_count = supply. Mengembalikan array ID yang dibuat.
 -- Item + log #1 + holdings dibuat dalam SATU statement.
 CREATE OR REPLACE FUNCTION ledger_mint_batch(p_entry_id bigint, p_issuer uuid, p_issuer_member uuid, p_batch int, p_prefix varchar DEFAULT '')
-RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
-DECLARE e ledger_entries; v_from int; v_to int; v_now timestamptz := clock_timestamp();
+RETURNS bigint[] LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE e ledger_entries; v_from int; v_to int; v_now timestamptz := clock_timestamp(); v_created_ids bigint[];
 BEGIN
   PERFORM ledger_require_actor(p_issuer, p_issuer_member);
   IF p_batch IS NULL OR p_batch < 1 OR p_batch > 100000 THEN
@@ -616,7 +627,7 @@ BEGIN
 
   v_from := e.minted_count + 1;
   v_to   := least(e.supply, e.minted_count + p_batch);
-  IF v_from > v_to THEN RETURN 0; END IF;     -- supply sudah penuh
+  IF v_from > v_to THEN RETURN ARRAY[]::bigint[]; END IF;     -- supply sudah penuh
 
   WITH base AS MATERIALIZED (
     SELECT g.id, g.serial_no,
@@ -634,21 +645,28 @@ BEGIN
     RETURNING *
   ), new_logs AS (
     INSERT INTO ledger_logs (collection_id, actor_id, actor_member_id, counterparty_id, created_at,
-                             seq, event_type, hash, payload, state_snapshot)
-    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint, b.h1, NULL,
-           ledger_collection_snapshot(ROW(c.*)::ledger_collections)
+                             seq, event_type, hash, payload)
+    SELECT b.id, p_issuer, p_issuer_member, NULL, v_now, 1, 1::smallint, b.h1, NULL
     FROM base b
-    JOIN new_cols c ON c.id = b.id
     RETURNING collection_id, hash
+  ), inserted_holdings AS (
+    INSERT INTO ledger_holdings (owner_id, collection_id, entry_id, acquired_at)
+    SELECT p_issuer, id, e.id, v_now FROM new_cols
+    RETURNING collection_id
   )
-  INSERT INTO ledger_holdings (owner_id, collection_id, entry_id, acquired_at)
-  SELECT p_issuer, id, e.id, v_now FROM new_cols;
+  SELECT array_agg(collection_id) INTO v_created_ids FROM inserted_holdings;
 
   UPDATE ledger_entries SET minted_count = v_to WHERE id = e.id;
-  RETURN v_to - v_from + 1;
+  RETURN coalesce(v_created_ids, ARRAY[]::bigint[]);
 END $$;
 
--- SEND: pemilik mengirim -> tanpa penerima. Kembalikan (seq, token UUID)
+-- hash token transfer. Token mentah (uuid v4, 122 bit acak) tidak pernah disimpan.
+CREATE OR REPLACE FUNCTION ledger_token_hash(p_token uuid) RETURNS bytea
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$$ SELECT sha256(convert_to(p_token::text, 'UTF8')) $$;
+
+-- SEND: pemilik mengirim -> tanpa penerima. Kembalikan (seq, token UUID).
+-- transfer_token hanya dikembalikan SEKALI di sini; DB hanya menyimpan sha256-nya.
 CREATE OR REPLACE FUNCTION ledger_send(p_collection_id bigint, p_actor uuid, p_actor_member uuid,
                             p_payload jsonb DEFAULT NULL,
                             OUT new_seq int, OUT transfer_token uuid)
@@ -663,15 +681,15 @@ BEGIN
 
   -- Log SEND: counterparty = NULL (penerima belum diketahui)
   SELECT * INTO w FROM ledger_write_log(c, 2::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
+                                        NULL, NULL, NULL, NULL);
   transfer_token := gen_random_uuid();
 
   UPDATE ledger_collections
      SET state = 2, last_seq = w.new_seq, last_hash = w.new_hash, updated_at = v_now
    WHERE id = c.id;
 
-  INSERT INTO ledger_transfer_tokens (token, collection_id, from_association_id, from_member_id, created_at)
-  VALUES (transfer_token, c.id, p_actor, p_actor_member, v_now);
+  INSERT INTO ledger_transfer_tokens (token_hash, collection_id, from_association_id, from_member_id, created_at)
+  VALUES (ledger_token_hash(transfer_token), c.id, p_actor, p_actor_member, v_now);
 
   new_seq := w.new_seq;
 END $$;
@@ -681,21 +699,30 @@ CREATE OR REPLACE FUNCTION ledger_claim_transfer(p_token uuid, p_actor uuid, p_a
 RETURNS int LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   t ledger_transfer_tokens; c ledger_collections; w record; v_now timestamptz := clock_timestamp();
+  v_hash bytea := ledger_token_hash(p_token); v_cid bigint;
 BEGIN
   PERFORM ledger_require_actor(p_actor, p_actor_member);
-  SELECT * INTO t FROM ledger_transfer_tokens WHERE token = p_token FOR UPDATE;
+
+  -- URUTAN LOCK WAJIB SAMA dengan ledger_cancel_send: collection DULU, baru token.
+  -- (Sebelumnya claim mengunci token->collection dan cancel collection->token = deadlock 40P01.)
+  -- collection_id di token beku (trigger), jadi membacanya tanpa lock aman.
+  SELECT collection_id INTO v_cid FROM ledger_transfer_tokens WHERE token_hash = v_hash;
   IF NOT FOUND THEN RAISE EXCEPTION 'token transfer tidak ditemukan' USING ERRCODE = 'LG001'; END IF;
+
+  SELECT * INTO c FROM ledger_collections WHERE id = v_cid FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'collection % tidak ada', v_cid USING ERRCODE = 'LG001'; END IF;
+
+  -- setelah collection terkunci, kunci token & validasi ulang (status bisa berubah selagi menunggu lock)
+  SELECT * INTO t FROM ledger_transfer_tokens WHERE token_hash = v_hash FOR UPDATE;
   IF t.claimed_by_id IS NOT NULL THEN RAISE EXCEPTION 'token sudah diklaim' USING ERRCODE = 'LG003'; END IF;
+  IF t.cancelled_at IS NOT NULL THEN RAISE EXCEPTION 'token sudah dibatalkan oleh pengirim' USING ERRCODE = 'LG003'; END IF;
   IF t.expires_at IS NOT NULL AND t.expires_at < v_now THEN RAISE EXCEPTION 'token sudah kedaluwarsa' USING ERRCODE = 'LG003'; END IF;
   IF t.from_association_id = p_actor THEN RAISE EXCEPTION 'tidak bisa mengklaim transfer sendiri' USING ERRCODE = 'LG004'; END IF;
-
-  SELECT * INTO c FROM ledger_collections WHERE id = t.collection_id FOR UPDATE;
-  IF NOT FOUND THEN RAISE EXCEPTION 'collection % tidak ada', t.collection_id USING ERRCODE = 'LG001'; END IF;
   IF c.state <> 2 THEN RAISE EXCEPTION 'collection tidak dalam pengiriman' USING ERRCODE = 'LG003'; END IF;
 
   -- Log RECEIVE: actor = penerima, counterparty = pengirim (pemilik lama)
   SELECT * INTO w FROM ledger_write_log(c, 3::smallint, p_actor, p_actor_member, c.owner_id, NULL, v_now,
-                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
+                                        NULL, NULL, NULL, NULL);
 
   UPDATE ledger_collections
      SET owner_id = p_actor, holder_id = p_actor_member, state = 1,
@@ -708,7 +735,7 @@ BEGIN
 
   UPDATE ledger_transfer_tokens
      SET claimed_by_id = p_actor, claimed_by_member_id = p_actor_member, claimed_at = v_now
-   WHERE token = p_token;
+   WHERE token_hash = v_hash;
 
   RETURN w.new_seq;
 END $$;
@@ -726,14 +753,17 @@ BEGIN
 
   -- Log CANCEL_SEND: counterparty = NULL
   SELECT * INTO w FROM ledger_write_log(c, 5::smallint, p_actor, p_actor_member, NULL, NULL, v_now,
-                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
+                                        NULL, NULL, NULL, NULL);
   UPDATE ledger_collections
      SET state = 1, last_seq = w.new_seq, last_hash = w.new_hash, updated_at = v_now
    WHERE id = c.id;
 
-  -- Kembalikan holder ke NULL (pengirim membatalkan; belum ada pemegang baru)
-  UPDATE ledger_collections SET holder_id = NULL WHERE id = c.id;
-  DELETE FROM ledger_transfer_tokens WHERE collection_id = c.id AND claimed_by_id IS NULL;
+  -- holder_id TIDAK diubah: ledger_send juga tidak mengubahnya, dan perubahan holder tanpa log
+  -- tidak bisa diverifikasi. Pergantian holder hanya lewat ledger_assign (event ASSIGN).
+  -- Token ditandai batal (bukan DELETE) supaya jejak pengiriman yang dibatalkan tetap ada.
+  -- Urutan lock: collection (sudah dikunci di atas) -> token, sama dengan ledger_claim_transfer.
+  UPDATE ledger_transfer_tokens SET cancelled_at = v_now
+   WHERE collection_id = c.id AND claimed_by_id IS NULL AND cancelled_at IS NULL;
   RETURN w.new_seq;
 END $$;
 
@@ -774,7 +804,7 @@ BEGIN
 
   -- Tulis ke chain sebagai event ASSIGN (6); counterparty = NULL
   SELECT * INTO w FROM ledger_write_log(c, 6::smallint, p_actor, p_actor_member, NULL, v_payload, v_now,
-                                        NULL, NULL, NULL, NULL, ledger_collection_snapshot(c));
+                                        NULL, NULL, NULL, NULL);
 
   -- Update kolom holder_id + last_seq/last_hash
   UPDATE ledger_collections
@@ -809,7 +839,7 @@ BEGIN
   END IF;
 
   SELECT * INTO w FROM ledger_write_log(c, 4::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                        NULL, NULL, p_action, NULL, ledger_collection_snapshot(c));
+                                        NULL, NULL, p_action, NULL);
   UPDATE ledger_collections
      SET last_seq = w.new_seq, last_hash = w.new_hash, tool_uses = tool_uses + 1, updated_at = v_now
    WHERE id = c.id;                       -- HOT update: tidak ada kolom ber-index yang berubah
@@ -886,9 +916,9 @@ BEGIN
 
   -- seq kedua sisi sudah pasti (baris terkunci) -> bisa saling di-hash
   SELECT * INTO wt FROM ledger_write_log(tool, 4::smallint, p_actor, p_actor_member, NULL, NULL, v_now,
-                                         tgt.id, tgt.last_seq + 1, p_action, NULL, ledger_collection_snapshot(tool));
+                                         tgt.id, tgt.last_seq + 1, p_action, NULL);
   SELECT * INTO wg FROM ledger_write_log(tgt, 7::smallint, p_actor, p_actor_member, NULL, p_payload, v_now,
-                                         tool.id, tool.last_seq + 1, p_action, p_content_hash, ledger_collection_snapshot(tgt));
+                                         tool.id, tool.last_seq + 1, p_action, p_content_hash);
   UPDATE ledger_collections
      SET last_seq = wt.new_seq, last_hash = wt.new_hash, tool_uses = tool_uses + 1, updated_at = v_now
    WHERE id = tool.id;
@@ -993,6 +1023,146 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------
+-- 12b. BLOK: Merkle root per jendela waktu, saling bertaut.
+--   * leaf  = sha256(0x00 || log.hash)           (domain separation, gaya RFC 6962)
+--   * node  = sha256(0x01 || kiri || kanan); node ganjil di ujung DINAIKKAN apa adanya
+--     (bukan diduplikasi: duplikasi membuat dua daftar log berbeda punya root sama).
+--   * urutan leaf = (created_at, collection_id, seq)  -> deterministik, bisa direplikasi di luar DB
+--   * jendela setengah-terbuka [window_start, window_end); window_start blok n = window_end blok n-1
+--   * blok pertama: prev_block_hash = 32 byte nol
+--   Keterbatasan: root dihitung dari satu array di memori. Pakai jendela pendek (mis. 1 menit);
+--   untuk throughput sangat besar, pecah jendela jadi sub-root per partisi.
+--   Log yang COMMIT setelah jendelanya disegel tidak masuk blok -> ledger_verify_blocks mendeteksinya
+--   (isi jendela berubah). Cegah dengan p_margin > durasi transaksi terlama (set
+--   idle_in_transaction_session_timeout / statement_timeout lebih kecil dari margin).
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION ledger_merkle_root(p_leaves bytea[]) RETURNS bytea
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE lvl bytea[]; n int;
+BEGIN
+  IF coalesce(array_length(p_leaves, 1), 0) = 0 THEN
+    RETURN sha256(''::bytea);
+  END IF;
+  SELECT array_agg(sha256(decode('00', 'hex') || u.l) ORDER BY u.i) INTO lvl
+    FROM unnest(p_leaves) WITH ORDINALITY AS u(l, i);
+  n := array_length(lvl, 1);
+  WHILE n > 1 LOOP
+    SELECT array_agg(CASE WHEN i < n THEN sha256(decode('01', 'hex') || lvl[i] || lvl[i + 1]) ELSE lvl[i] END ORDER BY i)
+      INTO lvl FROM generate_series(1, n, 2) AS i;
+    n := array_length(lvl, 1);
+  END LOOP;
+  RETURN lvl[1];
+END $$;
+
+CREATE OR REPLACE FUNCTION ledger_block_hash(p_prev bytea, p_block_no bigint, p_start timestamptz,
+                                             p_end timestamptz, p_count bigint, p_root bytea)
+RETURNS bytea LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$$ SELECT sha256(p_prev || convert_to(
+       p_block_no::text || '|' || ledger_micros(p_start)::text || '|' || ledger_micros(p_end)::text || '|' ||
+       p_count::text || '|' || encode(p_root, 'hex'), 'UTF8')) $$;
+
+-- SEAL: segel satu blok untuk log antara blok sebelumnya dan (sekarang - p_margin).
+-- Mengembalikan block_no, atau NULL bila belum ada log baru yang cukup tua.
+-- Jalankan dari job terjadwal (satu per menit), sebagai role sealer. READ COMMITTED.
+CREATE OR REPLACE FUNCTION ledger_seal_block(p_margin interval DEFAULT interval '5 minutes',
+                                             p_window_end timestamptz DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  prev ledger_blocks; v_found boolean; v_start timestamptz; v_end timestamptz;
+  v_leaves bytea[]; v_count bigint; v_root bytea; v_no bigint; v_prev_hash bytea;
+BEGIN
+  IF p_margin IS NULL OR p_margin < interval '0' THEN
+    RAISE EXCEPTION 'p_margin tidak valid' USING ERRCODE = 'LG004';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('ledger_seal_block', 0));   -- satu sealer pada satu waktu
+
+  SELECT * INTO prev FROM ledger_blocks ORDER BY block_no DESC LIMIT 1;
+  v_found := FOUND;
+  IF v_found THEN
+    v_start := prev.window_end;
+  ELSE
+    SELECT min(created_at) INTO v_start FROM ledger_logs;
+    IF v_start IS NULL THEN RETURN NULL; END IF;                            -- belum ada log sama sekali
+  END IF;
+
+  v_end := coalesce(p_window_end, clock_timestamp() - p_margin);
+  IF v_end > clock_timestamp() - p_margin THEN
+    RAISE EXCEPTION 'jendela belum cukup tua: window_end harus <= sekarang - %', p_margin USING ERRCODE = 'LG003';
+  END IF;
+  IF v_end <= v_start THEN RETURN NULL; END IF;
+
+  SELECT array_agg(hash ORDER BY created_at, collection_id, seq), count(*)
+    INTO v_leaves, v_count
+    FROM ledger_logs
+   WHERE created_at >= v_start AND created_at < v_end;
+  IF v_count = 0 THEN RETURN NULL; END IF;                                  -- jendela kosong: tunggu, jangan buat blok kosong
+
+  v_root      := ledger_merkle_root(v_leaves);
+  v_no        := CASE WHEN v_found THEN prev.block_no + 1 ELSE 1 END;
+  v_prev_hash := CASE WHEN v_found THEN prev.block_hash ELSE decode(repeat('00', 32), 'hex') END;
+
+  INSERT INTO ledger_blocks (block_no, window_start, window_end, log_count, merkle_root, prev_block_hash, block_hash)
+  VALUES (v_no, v_start, v_end, v_count, v_root, v_prev_hash,
+          ledger_block_hash(v_prev_hash, v_no, v_start, v_end, v_count, v_root));
+  RETURN v_no;
+END $$;
+
+-- VERIFIKASI blok: tautan hash, kontinuitas jendela, hitung ulang Merkle root + jumlah log.
+-- Mendeteksi: blok diubah, log disisipkan/dihapus/diubah setelah disegel, log yang commit terlambat.
+CREATE OR REPLACE FUNCTION ledger_verify_blocks(p_from bigint DEFAULT 1, p_to bigint DEFAULT NULL)
+RETURNS TABLE (valid boolean, broken_block_no bigint, detail text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  b ledger_blocks; pb ledger_blocks; v_exp_no bigint; v_exp_prev bytea; v_exp_start timestamptz;
+  v_leaves bytea[]; v_count bigint;
+BEGIN
+  IF p_from < 1 THEN p_from := 1; END IF;
+  IF p_from = 1 THEN
+    v_exp_prev := decode(repeat('00', 32), 'hex');
+    v_exp_start := NULL;
+  ELSE
+    SELECT * INTO pb FROM ledger_blocks WHERE block_no = p_from - 1;
+    IF NOT FOUND THEN RETURN QUERY SELECT false, p_from - 1, 'blok pendahulu tidak ada'; RETURN; END IF;
+    v_exp_prev := pb.block_hash; v_exp_start := pb.window_end;
+  END IF;
+  v_exp_no := p_from;
+
+  FOR b IN SELECT * FROM ledger_blocks WHERE block_no >= p_from AND (p_to IS NULL OR block_no <= p_to) ORDER BY block_no LOOP
+    IF b.block_no <> v_exp_no THEN
+      RETURN QUERY SELECT false, v_exp_no, 'nomor blok bolong'; RETURN;
+    END IF;
+    IF b.prev_block_hash <> v_exp_prev THEN
+      RETURN QUERY SELECT false, b.block_no, 'prev_block_hash tidak cocok dengan blok sebelumnya'; RETURN;
+    END IF;
+    IF v_exp_start IS NOT NULL AND b.window_start <> v_exp_start THEN
+      RETURN QUERY SELECT false, b.block_no, 'jendela tidak bersambung dengan blok sebelumnya'; RETURN;
+    END IF;
+    IF b.block_no = 1 AND EXISTS (SELECT 1 FROM ledger_logs WHERE created_at < b.window_start) THEN
+      RETURN QUERY SELECT false, b.block_no, 'ada log lebih tua dari blok pertama (commit terlambat)'; RETURN;
+    END IF;
+
+    SELECT array_agg(hash ORDER BY created_at, collection_id, seq), count(*)
+      INTO v_leaves, v_count
+      FROM ledger_logs
+     WHERE created_at >= b.window_start AND created_at < b.window_end;
+    IF v_count <> b.log_count THEN
+      RETURN QUERY SELECT false, b.block_no,
+        format('jumlah log berubah sejak disegel (blok %s, sekarang %s): log commit terlambat atau dihapus', b.log_count, v_count);
+      RETURN;
+    END IF;
+    IF ledger_merkle_root(v_leaves) <> b.merkle_root THEN
+      RETURN QUERY SELECT false, b.block_no, 'merkle_root tidak cocok dengan isi log'; RETURN;
+    END IF;
+    IF b.block_hash <> ledger_block_hash(b.prev_block_hash, b.block_no, b.window_start, b.window_end, b.log_count, b.merkle_root) THEN
+      RETURN QUERY SELECT false, b.block_no, 'block_hash tidak cocok'; RETURN;
+    END IF;
+
+    v_exp_no := b.block_no + 1; v_exp_prev := b.block_hash; v_exp_start := b.window_end;
+  END LOOP;
+  RETURN QUERY SELECT true, NULL::bigint, 'ok';
+END $$;
+
+-- ---------------------------------------------------------------------
 -- 13. HAK AKSES (opsional, aktif jika role `ledger_app` ada):
 --     aplikasi TIDAK boleh INSERT/UPDATE/DELETE langsung; hanya SELECT + EXECUTE.
 --     Registry diubah lewat migrasi oleh role pemilik, bukan oleh aplikasi.
@@ -1003,7 +1173,7 @@ END $$;
 --     Setelah ini, aplikasi harus connect sebagai ledger_app atau pemilik fungsi.
 -- ---------------------------------------------------------------------
 REVOKE EXECUTE ON FUNCTION ledger_write_log(ledger_collections, smallint, uuid, uuid, uuid, jsonb,
-                                            timestamptz, bigint, int, smallint, bytea, jsonb) FROM PUBLIC;
+                                            timestamptz, bigint, int, smallint, bytea) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION
   ledger_create_entry(uuid, uuid, text, int, jsonb, smallint),
   ledger_update_entry(bigint, uuid, uuid, text, int, jsonb, smallint),
@@ -1014,7 +1184,8 @@ REVOKE EXECUTE ON FUNCTION
   ledger_cancel_send(bigint, uuid, uuid),
   ledger_assign(bigint, uuid, uuid, uuid),
   ledger_use(bigint, uuid, uuid, smallint, jsonb),
-  ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb)
+  ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb),
+  ledger_seal_block(interval, timestamptz)
 FROM PUBLIC;
 
 DO $$
@@ -1023,7 +1194,8 @@ BEGIN
     GRANT SELECT ON ledger_entries, ledger_collections, ledger_logs, ledger_holdings,
                     ledger_transfer_tokens, ledger_blocks,
                     ledger_kinds, ledger_actions, ledger_action_rules, ledger_kind_issuers TO ledger_app;
-    GRANT INSERT ON ledger_blocks TO ledger_app;    -- sealer. Pisahkan ke role khusus bila perlu.
+    -- TIDAK ada INSERT langsung ke ledger_blocks: blok hanya lahir dari ledger_seal_block
+    -- (menghitung Merkle root dari log asli). INSERT langsung = siapa pun bisa memalsukan blok.
     GRANT EXECUTE ON FUNCTION ledger_create_entry(uuid, uuid, text, int, jsonb, smallint),
                               ledger_update_entry(bigint, uuid, uuid, text, int, jsonb, smallint),
                               ledger_delete_entry(bigint, uuid, uuid),
@@ -1034,6 +1206,32 @@ BEGIN
                               ledger_assign(bigint, uuid, uuid, uuid),
                               ledger_use(bigint, uuid, uuid, smallint, jsonb),
                               ledger_act(smallint, bigint, bigint, uuid, uuid, bytea, jsonb),
-                              ledger_verify_chain(bigint) TO ledger_app;
+                              ledger_verify_chain(bigint),
+                              ledger_verify_blocks(bigint, bigint) TO ledger_app;
+  END IF;
+
+  -- Sealer: idealnya role terpisah (CREATE ROLE ledger_sealer LOGIN ...). Bila belum ada,
+  -- ledger_app diberi hak seal supaya sealer lama tetap jalan -- pisahkan secepatnya.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_sealer') THEN
+    GRANT SELECT ON ledger_logs, ledger_blocks TO ledger_sealer;
+    GRANT EXECUTE ON FUNCTION ledger_seal_block(interval, timestamptz),
+                              ledger_verify_blocks(bigint, bigint) TO ledger_sealer;
+  ELSIF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') THEN
+    GRANT EXECUTE ON FUNCTION ledger_seal_block(interval, timestamptz) TO ledger_app;
+    RAISE NOTICE 'role ledger_sealer tidak ada: ledger_app diberi hak ledger_seal_block. Pisahkan ke role khusus.';
   END IF;
 END $$;
+
+CREATE MATERIALIZED VIEW ledger_collection_snapshots AS
+SELECT DISTINCT ON (target_id)
+    target_id AS collection_id,
+    created_at AS last_activity,
+    payload ->> 'page' AS last_page_known -- `page` ada dalam payload
+FROM ledger_logs
+ORDER BY target_id, created_at DESC;
+
+-- Buat index agar query API Anda langsung mendapatkan hasilnya dalam hitungan milidetik
+CREATE UNIQUE INDEX idx_snapshot_collection ON ledger_collection_snapshots(collection_id);
+
+-- TODO untuk Backend: Jalankan "REFRESH MATERIALIZED VIEW CONCURRENTLY ledger_collection_snapshots" (misalnya menggunakan celery)
+-- melalui Celery task atau cron setiap beberapa menit, BUKAN setiap kali ada aksi.

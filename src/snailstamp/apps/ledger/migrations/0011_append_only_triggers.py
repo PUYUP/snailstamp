@@ -16,7 +16,9 @@ CREATE TRIGGER {t}_no_truncate BEFORE TRUNCATE ON {t}
   FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation();
 """ for t in APPEND_ONLY),
     """
-CREATE TRIGGER ledger_blocks_no_truncate BEFORE TRUNCATE ON ledger_blocks
+-- ledger_blocks_no_truncate sudah dibuat oleh skema dasar (0001, revisi yang memuatnya), jadi di sini
+-- OR REPLACE: aman dijalankan baik di DB yang trigger-nya sudah ada maupun belum (skema dasar lama).
+CREATE OR REPLACE TRIGGER ledger_blocks_no_truncate BEFORE TRUNCATE ON ledger_blocks
   FOR EACH STATEMENT EXECUTE FUNCTION ledger_forbid_mutation();
 
 -- Sealer key: status/valid_until/metadata boleh berubah (rotate, expire, revoke), tapi identitasnya
@@ -46,7 +48,7 @@ CREATE TRIGGER ledger_sealer_keys_no_truncate BEFORE TRUNCATE ON ledger_sealer_k
 REVERSE = [
     *(f"DROP TRIGGER {t}_append_only ON {t}; DROP TRIGGER {t}_no_truncate ON {t};" for t in APPEND_ONLY),
     """
-DROP TRIGGER ledger_blocks_no_truncate ON ledger_blocks;
+-- ledger_blocks_no_truncate SENGAJA tidak di-drop: ia dimiliki skema dasar, bukan migrasi ini.
 DROP TRIGGER ledger_sealer_keys_guard ON ledger_sealer_keys;
 DROP TRIGGER ledger_sealer_keys_no_delete ON ledger_sealer_keys;
 DROP TRIGGER ledger_sealer_keys_no_truncate ON ledger_sealer_keys;

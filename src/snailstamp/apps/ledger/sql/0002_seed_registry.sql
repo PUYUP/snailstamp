@@ -22,7 +22,8 @@ INSERT INTO ledger_actions (id, code, label) VALUES
   (3, 'postmark', 'mengecap pos'),
   (4, 'expose',   'memotret'),
   (5, 'play',     'memutar'),
-  (6, 'read',     'membaca')          -- aksi tunggal: dipakai lewat ledger_use
+  (6, 'read',     'membaca'),          -- aksi tunggal: dipakai lewat ledger_use
+  (7, 'revise',   'revisi log')        -- aksi kompensasi / koreksi misalnya penggunaan "Tipe-X" (penghapus)
 ON CONFLICT (id) DO NOTHING;
 
 -- target_access: 1 pemilik sasaran | 2 siapa pun saat sasaran DIKIRIM | 3 siapa pun, sasaran aktif
@@ -32,5 +33,6 @@ INSERT INTO ledger_action_rules (action_id, tool_kind, target_kind, target_acces
   (2, 4, 3, 1),   -- perangko ditempel ke surat
   (3, 5, 3, 2),   -- cap pos mengecap surat YANG SEDANG DIKIRIM (oleh pemegang cap, mis. kantor pos)
   (4, 6, 7, 1),   -- kamera memotret rol film
-  (5, 8, 9, 1)    -- pemutar memutar piringan hitam
+  (5, 8, 9, 1),   -- pemutar memutar piringan hitam
+  (7, 1, 2, 1)    -- alat (misal pena/sistem) merevisi log pada jurnal milik sendiri
 ON CONFLICT (action_id, tool_kind, target_kind) DO NOTHING;

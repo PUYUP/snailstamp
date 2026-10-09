@@ -39,9 +39,10 @@ class Content(models.Model):
     # --- Content Info ---
     title = models.CharField(max_length=255, blank=True, help_text="Judul atau label singkat dari konten")
     format = models.CharField(max_length=20, choices=TextFormat.choices, default=TextFormat.PLAIN)
-    body = models.TextField(help_text="Isi konten teks utama")
+    body = models.TextField(help_text="Isi konten teks utama", blank=True)
     excerpt = models.CharField(max_length=255, blank=True, help_text="Preview singkat untuk list view")
-    
+    metadata = models.JSONField(default=dict, blank=True, help_text="Metadata tambahan untuk konten, misal tags, kategori, dsb.")
+
     # --- Integrity & Size ---
     content_hash = models.CharField(max_length=64, help_text="SHA256 hex dari kolom body")
     char_count = models.PositiveIntegerField(default=0, help_text="Jumlah karakter untuk fast query/lookup")
