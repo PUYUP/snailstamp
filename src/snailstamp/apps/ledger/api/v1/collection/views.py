@@ -1,5 +1,7 @@
+from drf_spectacular.utils import extend_schema
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
+from django.db import transaction
 from kombu.asynchronous.http import Response
 from rest_framework import generics, response, status
 from snailstamp.apps.tenant.models import Member
@@ -17,6 +19,7 @@ class ListCreateInventoryView(generics.ListCreateAPIView):
     queryset = Content.objects.filter(status=Content.ContentStatus.ACTIVE)
     serializer_class = CreateCollectionSerializer
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -49,9 +52,10 @@ class ListCreateInventoryView(generics.ListCreateAPIView):
             collection_id=collection_id,
             actor_id=actor_id,
             actor_member_id=member_id,
-            title=data.get('title', ''),
-            body=data['body'],
-            format=data.get('format', 'plain'),
+            body=data.get('body', ''),
+            metadata=data.get('metadata', {}),
+            format=data.get('format', 'json'),
+            genesis=True,
         )
 
         # return response.Response({

@@ -272,17 +272,17 @@ def act(action_code, tool_id, target_id, actor_id, actor_member_id, content=None
                        [_action_id(action_code), tool_id, target_id, actor_id, actor_member_id, content_hash, _json(payload)], row=True))
 
 
-def content_sha256(content, version=1):
-    # 1. Siapkan prefix versi (misal menjadi "hash_version_1:") dalam bentuk bytes
-    version_prefix = f"hash_version_{version}:".encode("utf-8")
-    
-    # 2. Konversi konten ke bytes jika masih string
-    content_bytes = content.encode("utf-8") if isinstance(content, str) else content
-    
-    # 3. Gabungkan prefix versi dengan konten asli
+def content_sha256(content: dict, version: int = 1) -> bytes:
+    version_prefix = f"content_version_{version}:".encode("utf-8")
+    content_bytes = json.dumps(
+        content,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
     payload_to_hash = version_prefix + content_bytes
-    
-    # 4. Lakukan hashing pada gabungan tersebut
+
     return hashlib.sha256(payload_to_hash).digest()
 
 
@@ -1314,29 +1314,30 @@ def verify_proof(proof, trusted_keys=None, threshold=1, min_regions=1):
 # File disimpan dengan content-addressable storage (nama = hash) untuk deduplication.
 # Integritas diverifikasi lewat ledger (content_hash di log ACTED_ON).
 
-def _file_sha256(file_obj, version=1):
-    """Hitung SHA256 file dengan menyertakan versi. file_obj bisa berupa File object atau path string."""
-    version_prefix = f"hash_version_{version}:".encode("utf-8")
-    hasher = hashlib.sha256()
+def _file_sha256(file_obj, version: int = 1):
+    """Hitung SHA256 file dengan prefix versi.
 
-    # 1. Masukkan prefix versi ke dalam perhitungan hash di awal
+    file_obj bisa berupa path string atau file-like object.
+    Mengembalikan digest dalam bentuk bytes.
+    """
+    version_prefix = f"file_version_{version}:".encode("utf-8")
+    hasher = hashlib.sha256()
     hasher.update(version_prefix)
 
-    # 2. Proses pembacaan file (secara streaming agar hemat memori)
-    if isinstance(file_obj, str):
-        with open(file_obj, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
+    if isinstance(file_obj, (str, bytes)):
+        with open(file_obj, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
                 hasher.update(chunk)
     else:
-        # File object (Django UploadedFile / InMemoryUploadedFile / TemporaryUploadedFile)
-        if hasattr(file_obj, 'seek'):
+        if hasattr(file_obj, "seek"):
             file_obj.seek(0)
-        for chunk in iter(lambda: f.read(8192), b''):
+
+        for chunk in iter(lambda: file_obj.read(8192), b""):
             hasher.update(chunk)
-        if hasattr(file_obj, 'seek'):
+
+        if hasattr(file_obj, "seek"):
             file_obj.seek(0)
-            
-    # 3. Kembalikan dalam bentuk bytes (atau gunakan .hexdigest() jika ingin string hex)
+
     return hasher.digest()
 
 
@@ -1510,7 +1511,7 @@ def get_asset(collection_id, status=None):
 
 def add_or_update_content(collection_id, actor_id, actor_member_id, body,
                           title="", format="plain", metadata=None,
-                          action_code="write"):
+                          action_code="write", genesis=False):
     """
     Tulis/update content dan catat di ledger.
     
@@ -1530,7 +1531,12 @@ def add_or_update_content(collection_id, actor_id, actor_member_id, body,
     _check_member(actor_id, actor_member_id)
 
     # Hitung hash
-    content_hash = content_sha256(body)
+    content_hash = content_sha256({
+        "body": body,
+        "title": title,
+        "format": format,
+        "metadata": metadata,
+    })
     hash_hex = content_hash.hex()
     
     # Delayed import untuk menghindari circular import
@@ -1561,17 +1567,20 @@ def add_or_update_content(collection_id, actor_id, actor_member_id, body,
         )
 
     # Log ke ledger (ACTED_ON event)
-    payload = {
-        "content_id": str(content.id),
-        "title": title,
-        "format": format,
-        "char_count": content.char_count,
-    }
-    if metadata:
-        payload["metadata"] = metadata
+    # hanya jika bukan kelahiran pertama
+    seq = None
+    if not genesis:
+        payload = {
+            "content_id": str(content.id),
+            "title": title,
+            "format": format,
+            "char_count": content.char_count,
+        }
+        if metadata:
+            payload["metadata"] = metadata
 
-    seq = act(action_code, collection_id, collection_id, actor_id, actor_member_id,
-              content_hash=content_hash, payload=payload)[0]
+        seq = act(action_code, collection_id, collection_id, actor_id, actor_member_id,
+                content_hash=content_hash, payload=payload)[0]
 
     return str(content.id), seq
 
